@@ -1,3 +1,88 @@
+# Try to connect MindONE to vllm-mindspore
+
+Maybe an easy way to connect mindone to vllm-ms. 
+
+Core idea is to re-use the Attention class in vllm-mindspore, which features the PagedAttention, FA, KV cache, and prefill-decode branch forard, etc.
+
+## versions
+
+Based on vllm-mindspore docker 0411, update
+- vllm-mindspore, master branch, 42df17c36c1f5
+    - add changes in this repo
+
+- mindone: https://github.com/SamitHuang/mindone/tree/vllm_qwen
+
+## running
+
+run_vllm_mindone.sh
+
+```shell
+export ASCEND_RT_VISIBLE_DEVICES=3,4
+
+# set path to your mindone and vllm-mindspore
+export PYTHONPATH=/home/hyx/vllm/vllm-mindspore:$PYTHONPATH
+export PYTHONPATH=/home/hyx/vllm/mindone:$PYTHONPATH
+
+# use MindONE backend
+export vLLM_MODEL_BACKEND=MindOne
+
+python test_vllm.py
+
+```
+
+test_vllm.py
+
+```python
+import vllm_mindspore # Add this line on the top of script.
+from vllm import LLM, SamplingParams
+
+# Sample prompts.
+prompts = [
+    "Hey, are you conscious? Can you talk to me?",
+    "What will talk to the last human being?"
+]
+
+# Create a sampling params object.
+sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=256)
+
+# Create an LLM.
+llm = LLM(model="/home/hyx/models/Qwen/Qwen2.5-7B-Instruct")
+outputs = llm.generate(prompts, sampling_params)
+# Print the outputs.
+for output in outputs:
+    prompt = output.prompt
+    generated_text = output.outputs[0].text
+    print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+```
+
+Result on qwen2.5 7b:
+
+bs=2, max_tokens=256, time cost 9s, ~ 57tokens/s
+
+## TODOs
+- [] in mindone/transformers/models/qwen/modeling_qwen_vllm.py, re-use more layers from mindone's implmentation, except for Qwen2Attention
+- [] Performance comparsion to MF backend. same infer_boost and jit_level
+
+## Add a New Model (a proposal)
+
+Pick one existing model that is the most similar the new model. Take `qwen2vl.py` as example.
+
+- In vllm-mindspore/model_executors/models/mo_models
+    ``` 
+    cp qwen2.py qwewn2vl.py
+    ```
+
+    call the Qwen2VLModel network from mindone, and change the lm head in this model, etc.
+
+- In mindone/transformers/models/qwen2vl
+    
+    ```
+    cp ../qwen2/modeling_qwen2_vllm.py modeling_qwen2vl_vllm.py
+    ```
+
+    Implement Qwen2VLModel based on vllm-ms Attention (self-attention), re-use the code in mindone modeling_qwen2vl.py as much as possible.
+
+
 # vllm-mindspore
 
 ## Overview
