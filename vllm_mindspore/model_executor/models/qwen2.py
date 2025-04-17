@@ -336,7 +336,8 @@ class Qwen2Model(nn.Cell):
     def get_input_embeddings(self, input_ids: Tensor) -> Tensor:
         return self.embed_tokens(input_ids)
 
-    @jit
+    # @jit
+    @jit(jit_level='O0', infer_boost='on')
     def construct(
         self,
         input_ids: Optional[Tensor],
@@ -523,6 +524,9 @@ class Qwen2ForCausalLM(MsModelBase):
         batch_valid_length = Tensor.from_numpy(np.array(attn_metadata.seq_lens, dtype=np.int32))
         q_seq_lens = Tensor.from_numpy(np.array(attn_metadata.query_lens, dtype=np.int32))
         block_tables = attn_metadata.block_tables
+
+        # import pdb; pdb.set_trace()
+
         model_output = self.model(input_ids,
                                   positions,
                                   key_cache,

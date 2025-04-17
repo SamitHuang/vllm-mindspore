@@ -57,7 +57,8 @@ class TestQwen:
         sampling_params = SamplingParams(temperature=0.0, max_tokens=10, top_k=1)
 
         # Create an LLM.
-        llm = LLM(model="/home/workspace/mindspore_dataset/weight/Qwen2.5-7B-Instruct",
+        # llm = LLM(model="/home/workspace/mindspore_dataset/weight/Qwen2.5-7B-Instruct",
+        llm = LLM(model="/home/hyx/models/Qwen/Qwen2.5-7B-Instruct",
                   gpu_memory_utilization=0.9, tensor_parallel_size=2)
         # Generate texts from the prompts. The output is a list of RequestOutput objects
         # that contain the prompt, generated text, and other information.

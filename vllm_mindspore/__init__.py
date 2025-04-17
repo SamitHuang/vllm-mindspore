@@ -19,6 +19,8 @@
 import sys
 import warnings
 
+print("DEBUG: using vllm-ms from ", __file__)
+
 if "vllm" in sys.modules:
     # Check models variable in sub process, cannot raise here.
     warnings.warn(

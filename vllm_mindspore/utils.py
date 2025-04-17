@@ -212,6 +212,12 @@ def is_mindformers_model_backend():
         and os.environ["vLLM_MODEL_BACKEND"] == "MindFormers"
     )
 
+def is_mindone_model_backend():
+    return (
+        os.getenv("vLLM_MODEL_BACKEND")
+        and os.environ["vLLM_MODEL_BACKEND"] == "MindOne"
+    )
+
 
 def check_ready():
     import vllm.envs as envs

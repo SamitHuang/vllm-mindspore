@@ -27,11 +27,12 @@ import cloudpickle
 
 from vllm.model_executor.models.registry import _ModelRegistry, _LazyRegisteredModel
 
-from vllm_mindspore.utils import is_mindformers_model_backend
+from vllm_mindspore.utils import is_mindformers_model_backend, is_mindone_model_backend
 
 _MINDSPORE_MODELS = {
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
+    "Qwen2VARForCausalLM": ("qwen2_var", "Qwen2VARForCausalLM"),
 }
 
 _MINDFORMERS_MODELS = {
@@ -40,23 +41,41 @@ _MINDFORMERS_MODELS = {
     "DeepSeekMTPModel": ("deepseek_mtp", "DeepseekV3MTPForCausalLM"),
 }
 
+_MINDONE_MODELS = {
+    "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
+}
+
+def get_model_info():
+    if is_mindformers_model_backend(): 
+        ret = {
+            model_arch: _LazyRegisteredModel(
+                module_name=f"vllm_mindspore.model_executor.models.mf_models.{mod_relname}",
+                class_name=cls_name,
+            )
+            for model_arch, (mod_relname, cls_name) in _MINDFORMERS_MODELS.items()
+        }
+    elif is_mindone_model_backend(): 
+        ret = {
+            model_arch: _LazyRegisteredModel(
+                module_name=f"vllm_mindspore.model_executor.models.mo_models.{mod_relname}",
+                class_name=cls_name,
+            )
+            for model_arch, (mod_relname, cls_name) in _MINDONE_MODELS.items()
+        }
+    else:
+        ret = {
+            model_arch: _LazyRegisteredModel(
+                module_name=f"vllm_mindspore.model_executor.models.{mod_relname}",
+                class_name=cls_name,
+            )
+            for model_arch, (mod_relname, cls_name) in _MINDSPORE_MODELS.items()
+        }
+
+    return ret
+
 MindSporeModelRegistry = _ModelRegistry(
-    {
-        model_arch: _LazyRegisteredModel(
-            module_name=f"vllm_mindspore.model_executor.models.{mod_relname}",
-            class_name=cls_name,
+        get_model_info()
         )
-        for model_arch, (mod_relname, cls_name) in _MINDSPORE_MODELS.items()
-    }
-    if not is_mindformers_model_backend()
-    else {
-        model_arch: _LazyRegisteredModel(
-            module_name=f"vllm_mindspore.model_executor.models.mf_models.{mod_relname}",
-            class_name=cls_name,
-        )
-        for model_arch, (mod_relname, cls_name) in _MINDFORMERS_MODELS.items()
-    }
-)
 
 _T = TypeVar("_T")
 
