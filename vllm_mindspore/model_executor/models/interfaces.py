@@ -18,6 +18,69 @@
 
 from typing import (TYPE_CHECKING, ClassVar, Dict, List, Literal, Optional,
                     Protocol, Type, Union, overload, runtime_checkable)
+from typing_extensions import TypeVar
+import mindspore as ms
+from vllm.multimodal.inputs import NestedTensors
+from vllm.attention import AttentionMetadata
+
+
+T = TypeVar("T", default="NestedTensors")
+
+
+@runtime_checkable
+class SupportsMultiModal(Protocol):
+    """The interface required for all multi-modal models."""
+
+    supports_multimodal: ClassVar[Literal[True]] = True
+    """
+    A flag that indicates this model supports multi-modal inputs.
+
+    Note:
+        There is no need to redefine this flag if this class is in the
+        MRO of your model class.
+    """
+
+    def get_multimodal_embeddings(self, **kwargs) -> Optional[T]:
+        """
+        Returns multimodal embeddings generated from multimodal kwargs 
+        to be merged with text embeddings.
+
+        The output embeddings must be one of the following formats:
+    
+        - A list or tuple of 2D tensors, where each tensor corresponds to
+          each input multimodal data item (e.g, image).
+        - A single 3D tensor, with the batch dimension grouping the 2D tensors.
+
+        Note:
+            The returned multimodal embeddings must be in the same order as
+            the appearances of their corresponding multimodal data item in the
+            input prompt.
+        """
+        ...
+
+    # Only for models that support v0 chunked prefill
+    # TODO(ywang96): Remove this overload once v0 is deprecated
+    @overload
+    def get_input_embeddings(
+        self,
+        input_ids: ms.Tensor,
+        multimodal_embeddings: Optional[T] = None,
+        attn_metadata: Optional["AttentionMetadata"] = None,
+    ) -> ms.Tensor:
+        ...
+
+    @overload
+    def get_input_embeddings(
+        self,
+        input_ids: ms.Tensor,
+        multimodal_embeddings: Optional[T] = None,
+    ) -> ms.Tensor:
+        """
+        Returns the input embeddings merged from the text embeddings from 
+        input_ids and the multimodal embeddings generated from multimodal 
+        kwargs.
+        """
+        ...
 
 @runtime_checkable
 class SupportsLoRA(Protocol):

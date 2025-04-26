@@ -16,14 +16,159 @@
 # limitations under the License.
 # ============================================================================
 
-from typing import List, Tuple
+from typing import List, Tuple, Iterable, Mapping, Optional, Union
+from dataclasses import dataclass, field
 
 from vllm.sequence import IntermediateTensors
+from vllm.multimodal import NestedTensors
 
 from vllm_mindspore.utils import get_valid_dtype
 
 import mindspore as ms
+import mindspore.nn as nn
 from mindspore import mint
+
+
+WeightsMapping = Mapping[str, Optional[str]]
+"""If a key maps to a value of `None`, the corresponding weight is ignored."""
+
+
+@dataclass
+class WeightsMapper:
+    """Maps the name of each weight if they match the following patterns."""
+
+    orig_to_new_substr: WeightsMapping = field(default_factory=dict)
+    orig_to_new_prefix: WeightsMapping = field(default_factory=dict)
+    orig_to_new_suffix: WeightsMapping = field(default_factory=dict)
+
+    def _map_name(self, key: str) -> Optional[str]:
+        for substr, new_key in self.orig_to_new_substr.items():
+            if substr in key:
+                if new_key is None:
+                    return None
+
+                key = key.replace(substr, new_key, 1)
+
+        for prefix, new_key in self.orig_to_new_prefix.items():
+            if key.startswith(prefix):
+                if new_key is None:
+                    return None
+
+                key = key.replace(prefix, new_key, 1)
+
+        for suffix, new_key in self.orig_to_new_suffix.items():
+            if key.endswith(suffix):
+                if new_key is None:
+                    return None
+
+                key = new_key.join(key.rsplit(suffix, 1))
+
+        return key
+
+    def apply(
+        self, weights: Iterable[Tuple[str, ms.Tensor]]
+    ) -> Iterable[Tuple[str, ms.Tensor]]:
+        return ((out_name, data) for name, data in weights
+                if (out_name := self._map_name(name)) is not None)
+    
+
+def _flatten_embeddings(embeddings: NestedTensors) -> ms.Tensor:
+    """
+    Recursively flattens and concatenates NestedTensors on all but the last
+    dimension.
+    """
+
+    if isinstance(embeddings, ms.Tensor):
+        # Flatten all but the last dimension.
+        return embeddings.flatten(0, -2)
+
+    return mint.cat(tuple(_flatten_embeddings(t) for t in embeddings))
+
+
+def _embedding_count_expression(embeddings: NestedTensors) -> str:
+    """
+    Constructs a debugging representation of the number of embeddings in the
+    NestedTensors.
+    """
+
+    if isinstance(embeddings, ms.Tensor):
+        return " x ".join([str(dim) for dim in embeddings.shape[:-1]])
+
+    return " + ".join(
+        _embedding_count_expression(inner) for inner in embeddings)
+
+
+def _merge_multimodal_embeddings(
+    inputs_embeds: ms.Tensor,
+    is_multimodal: ms.Tensor,
+    multimodal_embeddings: NestedTensors,
+) -> ms.Tensor:
+    """
+    Merge ``multimodal_embeddings`` into ``inputs_embeds`` by overwriting the
+    positions in ``inputs_embeds`` corresponding to placeholder tokens in
+    ``input_ids``.
+
+    Note:
+        This updates ``inputs_embeds`` in place.
+    """
+    num_expected_tokens = is_multimodal.sum().item()
+    assert isinstance(num_expected_tokens, int)
+
+    flattened = _flatten_embeddings(multimodal_embeddings)
+    if flattened.shape[0] != num_expected_tokens:
+        expr = _embedding_count_expression(multimodal_embeddings)
+        raise ValueError(
+            f"Attempted to assign {expr} = {flattened.shape[0]} "
+            f"multimodal tokens to {num_expected_tokens} placeholders")
+
+    inputs_embeds[is_multimodal] = flattened
+    return inputs_embeds
+
+
+def merge_multimodal_embeddings(
+    input_ids: ms.Tensor,
+    inputs_embeds: ms.Tensor,
+    multimodal_embeddings: NestedTensors,
+    placeholder_token_id: Union[int, List[int]],
+) -> ms.Tensor:
+    """
+    Merge ``multimodal_embeddings`` into ``inputs_embeds`` by overwriting the
+    positions in ``inputs_embeds`` corresponding to placeholder tokens in
+    ``input_ids``.
+    
+    ``placeholder_token_id`` can be a list of token ids (e.g, token ids 
+    of img_start, img_break, and img_end tokens) when needed: This means 
+    the order of these tokens in the ``input_ids`` MUST MATCH the order of 
+    their embeddings in ``multimodal_embeddings`` since we need to 
+    slice-merge instead of individually scattering.
+
+    For example, if input_ids is "TTTTTSIIIBIIIBIIIETTT", where
+    - T is text token
+    - S is image start token
+    - I is image embedding token
+    - B is image break token
+    - E is image end token.
+    
+    Then the image embeddings (that correspond to I's) from vision encoder 
+    must be padded with embeddings of S, B, and E in the same order of 
+    input_ids for a correct embedding merge.
+
+    Note:
+        This updates ``inputs_embeds`` in place.
+    """
+    if isinstance(placeholder_token_id, list):
+        placeholder_token_id = ms.tensor(placeholder_token_id)
+        return _merge_multimodal_embeddings(
+            inputs_embeds,
+            ms.numpy.isin(input_ids, placeholder_token_id),
+            multimodal_embeddings,
+        )
+
+    return _merge_multimodal_embeddings(
+        inputs_embeds,
+        (input_ids == placeholder_token_id),
+        multimodal_embeddings,
+    )
 
 
 class PPMissingLayer(ms.nn.Cell):
@@ -82,7 +227,7 @@ def make_layers(
     num_hidden_layers: int,
     layer_fn,
     prefix: str,
-) -> Tuple[int, int, ms.nn.CellList]:
+) -> Tuple[int, int, nn.CellList]:
     """Make a list of layers with the given layer function, taking
     pipeline parallelism into account.
     """
@@ -92,7 +237,7 @@ def make_layers(
     start_layer, end_layer = get_pp_indices(
         num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
     )
-    modules = ms.nn.CellList(
+    modules = nn.CellList(
         [PPMissingLayer() for _ in range(start_layer)]
         + [
             maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
