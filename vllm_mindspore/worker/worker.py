@@ -56,13 +56,14 @@ def _prepare_input_for_warmup(model_config, model_runner, cache_engine, is_prefi
             sampling_params=SamplingParams(),
             block_tables={idx: block_tables},
             lora_request=None,
-            multi_modal_data=None,
-            multi_modal_placeholders=None,
+            multi_modal_data=dummy_data.multi_modal_data,
+            multi_modal_placeholders=dummy_data.multi_modal_placeholders
         )
         for idx in range(bs)
     ]
 
-    model_input = model_runner.prepare_model_input(seqs)
+    finished_requests_ids = [seq.request_id for seq in seqs]
+    model_input = model_runner.prepare_model_input(seqs, finished_requests_ids=finished_requests_ids)
     block_tables = model_input.attn_metadata.block_tables
     if block_tables is not None and block_tables.numel() <= 0:
         model_input.attn_metadata.block_tables = torch.zeros((1, 1), dtype=torch.int32)
@@ -76,7 +77,8 @@ def _warm_up_model(self) -> None:
     # cache_engine is a list with length equal to the size of pipeline-parallel, and only pp=1 is supported.
     kv_cache = self.cache_engine[0].gpu_cache
     is_mtp_model = self.speculative_config is not None and self.model_config.hf_config.model_type == "deepseek_mtp"
-    if is_mtp_model:
+    max_mm_tokens = self.model_runner.mm_registry.get_max_multimodal_tokens(self.model_config)
+    if is_mtp_model or max_mm_tokens > 0:
         # prefill mtp model
         model_input, previous_hidden_states = _prepare_input_for_warmup(self.model_config, self.model_runner,
                                                                         self.cache_engine[0], True, is_mtp_model)

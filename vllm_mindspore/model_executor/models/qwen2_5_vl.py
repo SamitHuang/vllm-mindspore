@@ -1112,6 +1112,10 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
                     video_input=video_input)
                 input_ids = None
 
+        # a patch to avoid compiling different positions format between warm-up and real-run
+        if positions.ndim == 1:
+            positions = mint.tile(positions.expand_dims(0), (3, 1))
+
         if attn_metadata.num_prefill_tokens > 0:
             inputs_embeds = inputs_embeds.expand_dims(0)
             self.set_model_inputs(input_ids, positions, inputs_embeds)
