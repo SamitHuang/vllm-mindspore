@@ -33,7 +33,7 @@ print("==========================")
 
 
 # Load image using PIL.Image
-image = Image.open("demo.jpeg").resize((256, 256)).convert("RGB")
+image = Image.open("demo.jpeg")
 
 # Create a sampling params object.
 sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=256)
