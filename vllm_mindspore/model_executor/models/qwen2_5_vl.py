@@ -1161,8 +1161,14 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    ms.Tensor]]) -> Set[str]:
         params_dict = self.get_params_dict()
-        self.model.load_weights(weights, params_dict)
-        # self.visual.load_weights(weights, params_dict)
+        model_weights, visual_weights = [], []
+        for k, v in weights:
+            if "visual." in k:
+                visual_weights.append((k, v))
+            else:
+                model_weights.append((k, v))
+        self.model.load_weights(model_weights, params_dict)
+        self.visual.load_weights(visual_weights, params_dict)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """
