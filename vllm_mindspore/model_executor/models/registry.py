@@ -21,13 +21,13 @@ import pickle
 import subprocess
 import sys
 import tempfile
-from typing import Callable, TypeVar, Optional
+from typing import Callable, TypeVar
 
 import cloudpickle
 
 from vllm_mindspore.utils import is_mindformers_model_backend, is_mindone_model_backend
 
-from vllm.model_executor.models.registry import _ModelRegistry, _LazyRegisteredModel, _BaseRegisteredModel, _ModelInfo, logger
+from vllm.model_executor.models.registry import _ModelRegistry, _LazyRegisteredModel
 
 _MINDSPORE_MODELS = {
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
@@ -82,7 +82,7 @@ _T = TypeVar("_T")
 
 
 _SUBPROCESS_COMMAND = [
-    sys.executable, "-m", "vllm_mindspore.model_executor.models.registry"
+    sys.executable, "-m", "vllm.model_executor.models.registry"
 ]
 
 
@@ -93,18 +93,6 @@ def _run() -> None:
 
     with open(output_file, "wb") as f:
         f.write(pickle.dumps(result))
-
-
-def _try_inspect_model_cls(
-    model_arch: str,
-    model: _BaseRegisteredModel,
-) -> Optional[_ModelInfo]:
-    try:
-        return model.inspect_model_cls()
-    except Exception:
-        logger.exception("Error in inspecting model architecture '%s'",
-                         model_arch)
-        return None
 
 
 if __name__ == "__main__":
