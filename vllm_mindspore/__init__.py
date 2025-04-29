@@ -19,8 +19,6 @@
 import sys
 import warnings
 
-import vllm.model_executor.models
-
 print("DEBUG: using vllm-ms from ", __file__)
 
 if "vllm" in sys.modules:
