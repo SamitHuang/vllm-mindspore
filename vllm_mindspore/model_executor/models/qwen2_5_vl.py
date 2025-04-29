@@ -1070,6 +1070,10 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
             dyn_inputs_embeds
         )
 
+        self.lm_head.set_inputs(
+            ms.Tensor(shape=[None], dtype=ms.int64)
+        )
+
     def forward(
         self,
         input_ids: ms.Tensor,
