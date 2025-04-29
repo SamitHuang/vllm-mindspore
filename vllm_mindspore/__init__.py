@@ -223,6 +223,17 @@ RejectionSampler._smallest_positive_value = _smallest_positive_value
 RejectionSampler._smallest_positive_value.__set_name__(RejectionSampler, '_smallest_positive_value')
 vllm.model_executor.layers.rejection_sampler._multinomial = _multinomial
 
+from vllm_mindspore.multimodal.inputs import as_kwargs
+from vllm.multimodal.inputs import MultiModalKwargs
+MultiModalKwargs.as_kwargs = as_kwargs
+
+from vllm_mindspore.inputs.registry import call_hf_processor
+from vllm.inputs.registry import InputProcessingContext
+InputProcessingContext.call_hf_processor = call_hf_processor
+
+from vllm_mindspore.model_executor.layers.rotary_embedding import MRotaryEmbedding
+vllm.model_executor.layers.rotary_embedding.MRotaryEmbedding.get_input_positions = MRotaryEmbedding.get_input_positions
+
 from .utils import check_ready
 
 check_ready()

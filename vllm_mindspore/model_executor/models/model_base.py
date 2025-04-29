@@ -163,6 +163,7 @@ class MsModelBase():
         inputs_embeds: Optional[Tensor] = None,
         previous_hidden_states: Optional[Tensor] = None,
         spec_step_idx: int = 0,
+        **kwargs,
     ) -> Union[Tensor, IntermediateTensors]:
         return self.forward(
             input_ids,
@@ -172,7 +173,8 @@ class MsModelBase():
             intermediate_tensors,
             inputs_embeds,
             previous_hidden_states=previous_hidden_states,
-            spec_step_idx=spec_step_idx
+            spec_step_idx=spec_step_idx,
+            **kwargs,
         )
 
     def forward(
