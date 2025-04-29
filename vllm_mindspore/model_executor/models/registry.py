@@ -82,7 +82,7 @@ _T = TypeVar("_T")
 
 
 _SUBPROCESS_COMMAND = [
-    sys.executable, "-m", "vllm.model_executor.models.registry"
+    sys.executable, "-m", "vllm_mindspore.model_executor.models.registry"
 ]
 
 
