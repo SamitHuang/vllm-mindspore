@@ -25,7 +25,7 @@
 # limitations under the License.
 """Inference-only Qwen2.5-VL model compatible with HuggingFace weights."""
 from functools import partial
-from typing import Callable, Iterable, List, Literal, Mapping, Optional, Set, Tuple, TypedDict, Union, Dict, Any
+from typing import Callable, Iterable, List, Mapping, Optional, Set, Tuple, Union, Dict, Any
 
 import numpy as np
 import math
@@ -56,6 +56,7 @@ from vllm_mindspore.utils import STR_DTYPE_TO_MS_DTYPE
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_vl import Qwen2VLDummyInputsBuilder as Qwen2_5_VLDummyInputsBuilder
 from vllm.model_executor.models.qwen2_vl import Qwen2VLMultiModalProcessor, Qwen2VLProcessingInfo
+from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLImageInputs, Qwen2_5_VLVideoInputs, Qwen2_5_VLImagePixelInputs, Qwen2_5_VLImageEmbeddingInputs, Qwen2_5_VLVideoPixelInputs, Qwen2_5_VLVideoEmbeddingInputs
 from vllm.attention import AttentionMetadata
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -111,90 +112,6 @@ class _Qwen2VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
                                     modality=modality),
             ) for modality in ("image", "video")
         ]
-
-
-class Qwen2_5_VLImagePixelInputs(TypedDict):
-    type: Literal["pixel_values"]
-    pixel_values: ms.Tensor
-    """Shape:
-    `(num_patches, num_channels * patch_size * patch_size)`
-    """
-
-    image_grid_thw: ms.Tensor
-    """Shape: `(num_images, 3)`
-    This should be in `(grid_t, grid_h, grid_w)` format.
-    """
-
-
-class Qwen2_5_VLImageEmbeddingInputs(TypedDict):
-    type: Literal["image_embeds"]
-    image_embeds: ms.Tensor
-    """Supported types:
-    - List[`ms.Tensor`]: A list of tensors holding all images' features.
-        Each tensor holds an image's features.
-    - `ms.Tensor`: A tensor holding all images' features
-        (concatenation of all images' feature tensors).
-
-    Tensor shape: `(num_image_features, hidden_size)`
-    - `num_image_features` varies based on
-        the number and resolution of the images.
-    - `hidden_size` must match the hidden size of language model backbone.
-    """
-
-    image_grid_thw: ms.Tensor
-    """Shape: `(num_images, 3)`
-    This should be in `(grid_t, grid_h, grid_w)` format.
-    """
-
-
-Qwen2_5_VLImageInputs = Union[Qwen2_5_VLImagePixelInputs,
-                              Qwen2_5_VLImageEmbeddingInputs]
-
-
-class Qwen2_5_VLVideoPixelInputs(TypedDict):
-    type: Literal["pixel_values_videos"]
-    pixel_values_videos: ms.Tensor
-    """Shape:
-    `(num_patches,
-      num_channels * temporal_patch_size * patch_size * patch_size)`
-    """
-
-    video_grid_thw: ms.Tensor
-    """Shape: `(num_videos, 3)`
-
-    This should be in `(grid_t, grid_h, grid_w)` format.
-    """
-
-    second_per_grid_ts: ms.Tensor
-    """
-    The video time interval (in seconds) for each grid along the temporal 
-    dimension in the 3D position IDs. Returned when `videos` is not `None`.
-    """
-
-
-class Qwen2_5_VLVideoEmbeddingInputs(TypedDict):
-    type: Literal["video_embeds"]
-    video_embeds: ms.Tensor
-    """Supported types:
-    - List[`ms.Tensor`]: A list of tensors holding all videos' features.
-        Each tensor holds an video's features.
-    - `ms.Tensor`: A tensor holding all videos' features
-      (concatenation of all videos' feature tensors).
-
-    Tensor shape: `(num_image_features, hidden_size)`
-    - `num_image_features` varies based on
-        the number and resolution of the videos.
-    - `hidden_size` must match the hidden size of language model backbone.
-    """
-
-    video_grid_thw: ms.Tensor
-    """Shape: `(num_videos, 3)`
-    This should be in `(grid_t, grid_h, grid_w)` format.
-    """
-
-
-Qwen2_5_VLVideoInputs = Union[Qwen2_5_VLVideoPixelInputs,
-                              Qwen2_5_VLVideoEmbeddingInputs]
 
 # === Vision Encoder === #
 
