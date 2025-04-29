@@ -71,7 +71,6 @@ vllm.executor.cuda_device_count_stateless = ascend_device_count_stateless
 from vllm_mindspore.model_executor.models.registry import (
     MindSporeModelRegistry,
     _SUBPROCESS_COMMAND,
-    _try_inspect_model_cls
 )
 
 vllm.config.ModelRegistry = MindSporeModelRegistry
@@ -80,7 +79,6 @@ import vllm.model_executor
 
 vllm.model_executor.models.ModelRegistry = MindSporeModelRegistry
 vllm.model_executor.models.registry._SUBPROCESS_COMMAND = _SUBPROCESS_COMMAND
-vllm.model_executor.models.registry._try_inspect_model_cls = _try_inspect_model_cls
 
 from vllm_mindspore.model_executor.model_loader.utils import get_ms_model_architecture
 
