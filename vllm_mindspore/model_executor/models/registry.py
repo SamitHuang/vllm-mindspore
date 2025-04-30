@@ -33,7 +33,6 @@ _MINDSPORE_MODELS = {
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
     "Qwen2VARForCausalLM": ("qwen2_var", "Qwen2VARForCausalLM"),
-    "Qwen2_5_VLForConditionalGeneration": {"qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"}
 }
 
 _MINDFORMERS_MODELS = {
@@ -44,6 +43,7 @@ _MINDFORMERS_MODELS = {
 
 _MINDONE_MODELS = {
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
+    "Qwen2_5_VLForConditionalGeneration": {"qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"}
 }
 
 def get_model_info():

@@ -236,4 +236,8 @@ vllm.model_executor.layers.rotary_embedding.MRotaryEmbedding.get_input_positions
 
 from .utils import check_ready
 
+from vllm_mindspore.engine.multiprocessing.engine import cleanup
+import vllm.engine.multiprocessing.engine
+vllm.engine.multiprocessing.engine.MQLLMEngine.cleanup = cleanup
+
 check_ready()
