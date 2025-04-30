@@ -1,9 +1,10 @@
 export ASCEND_RT_VISIBLE_DEVICES=5
 export PYTHONPATH=/home/hyx/vllm/vllm-mindspore:$PYTHONPATH
 
-# default backend 
-unset vLLM_MODEL_BACKEND
+# backend 
+# unset vLLM_MODEL_BACKEND
 # export vLLM_MODEL_BACKEND=MindFormers
+export vLLM_MODEL_BACKEND=MindOne
 
 export vLLM_MODEL_MEMORY_USE_GB=50
 export ASCEND_TOTAL_MEMORY_GB=64
@@ -22,7 +23,7 @@ export ASCEND_TOTAL_MEMORY_GB=64
 python3 -m vllm_mindspore.entrypoints vllm.entrypoints.openai.api_server \
     --model /home/mikecheung/model/Qwen2.5-VL-3B-Instruct \
     --port 9529 \
-    --max-num-seqs 6 \
+    --max-num-seqs 12 \
     --max-model-len 32768 
 
     # --max-num-batched-tokens 2048 \
