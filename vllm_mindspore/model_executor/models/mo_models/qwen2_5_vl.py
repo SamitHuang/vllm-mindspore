@@ -36,7 +36,6 @@ import mindspore.ops as ops
 import mindspore.mint.nn.functional as F
 
 from transformers import BatchFeature
-from transformers.models.qwen2_5_vl import Qwen2_5_VLProcessor
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 
 from vllm_mindspore.model_executor.sampling_metadata import SamplingMetadata
@@ -55,8 +54,8 @@ from vllm_mindspore.utils import STR_DTYPE_TO_MS_DTYPE
 
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_vl import Qwen2VLDummyInputsBuilder as Qwen2_5_VLDummyInputsBuilder
-from vllm.model_executor.models.qwen2_vl import Qwen2VLMultiModalProcessor, Qwen2VLProcessingInfo
-from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLImageInputs, Qwen2_5_VLVideoInputs, Qwen2_5_VLImagePixelInputs, Qwen2_5_VLImageEmbeddingInputs, Qwen2_5_VLVideoPixelInputs, Qwen2_5_VLVideoEmbeddingInputs
+from vllm.model_executor.models.qwen2_vl import Qwen2VLMultiModalProcessor
+from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLImageInputs, Qwen2_5_VLVideoInputs, Qwen2_5_VLImagePixelInputs, Qwen2_5_VLImageEmbeddingInputs, Qwen2_5_VLVideoPixelInputs, Qwen2_5_VLVideoEmbeddingInputs, Qwen2_5_VLProcessingInfo
 from vllm.attention import AttentionMetadata
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -64,7 +63,8 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargs
 from vllm.multimodal.processing import PromptReplacement
 from vllm.multimodal.parse import MultiModalDataItems
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank, tensor_model_parallel_all_gather
+from vllm.distributed import utils as dist_utils
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import uses_mrope
 
@@ -154,40 +154,10 @@ class Qwen2_5_VisionMLP(nn.Cell):
         return x_down
 
 
-def rotate_half_flashatt(x: ms.Tensor, interleaved: bool = False) -> ms.Tensor:
-    if not interleaved:
-        x1, x2 = mint.chunk(x, 2, dim=-1)
-        return mint.cat((-x2, x1), dim=-1)
-    else:
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        return mint.stack((-x2, x1), dim=-1).flatten(-2)
-
-
-def apply_rotary_emb_flashatt(x: ms.Tensor, cos: ms.Tensor, sin: ms.Tensor, interleaved: bool = False) -> ms.Tensor:
-    """
-    x: (batch_size, seqlen, nheads, headdim)
-    cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
-    """
-    ro_dim = cos.shape[-1] * 2
-    assert ro_dim <= x.shape[-1]
-    if not interleaved:
-        cos = mint.tile(cos[:, None, :], (1, 1, 2))
-        sin = mint.tile(sin[:, None, :], (1, 1, 2))
-    else:
-        cos = mint.repeat_interleave(cos[:, None, :], (1, 1, 2))
-        sin = mint.repeat_interleave(sin[:, None, :], (1, 1, 2))
-    return mint.cat(
-        [x[..., :ro_dim] * cos + rotate_half_flashatt(x[..., :ro_dim], interleaved) * sin, x[..., ro_dim:]], dim=-1
-    )
-
-
 def apply_rotary_pos_emb_flashatt(q: ms.Tensor, k: ms.Tensor, cos: ms.Tensor, sin: ms.Tensor) -> Tuple[ms.Tensor, ms.Tensor]:
-    cos, _ = mint.chunk(cos, 2, dim=-1)
-    sin, _ = mint.chunk(sin, 2, dim=-1)
-    q_embed = apply_rotary_emb_flashatt(q.float(), cos, sin).type_as(q)
-    k_embed = apply_rotary_emb_flashatt(k.float(), cos, sin).type_as(k)
+    q_embed = ops.rotary_position_embedding(q.float(), cos, sin).type_as(q)
+    k_embed = ops.rotary_position_embedding(k.float(), cos, sin).type_as(k)
     return q_embed, k_embed
-
 
 
 class Qwen2_5_VisionAttention(nn.Cell):
@@ -202,12 +172,10 @@ class Qwen2_5_VisionAttention(nn.Cell):
     ) -> None:
         super().__init__()
         # Per attention head and per partition values.
-        # TODO: support TP
-        self.tp_size = 1
-        self.tp_rank = 1
-        # TODO: use dist_utils.divide
-        self.hidden_size_per_attention_head = projection_size // num_heads
-        self.num_attention_heads_per_partition = num_heads // self.tp_size
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.hidden_size_per_attention_head = dist_utils.divide(projection_size, num_heads)
+        self.num_attention_heads_per_partition = dist_utils.divide(num_heads, self.tp_size)
         self.num_heads = num_heads
 
         self.qkv = ColumnParallelLinear(input_size=embed_dim,
@@ -220,6 +188,29 @@ class Qwen2_5_VisionAttention(nn.Cell):
                                       quant_config=quant_config,
                                       prefix=f"{prefix}.proj",
                                       params_dtype=ms.bfloat16)
+        
+    def split_qkv(self, qkv: ms.Tensor) -> tuple[ms.Tensor, ...]:
+        # [s, 3 * head * head_dim]
+        seq_len, _ = qkv.shape
+        if self.tp_size > 1:
+            qkv = tensor_model_parallel_all_gather(qkv)
+
+        # [s, 3 * head * head_dim] -> 3 * [s, head * head_dim]
+        q, k, v = mint.chunk(qkv, 3, dim=-1)
+
+        # 3 * [s, head * head_dim]
+        if self.tp_size > 1:
+            splitter = partial(dist_utils.split_tensor_along_last_dim,
+                               num_partitions=self.tp_size)
+            q = splitter(q)[self.tp_rank]
+            k = splitter(k)[self.tp_rank]
+            v = splitter(v)[self.tp_rank]
+
+        # 3 * [s, head * head_dim] -> 3 * [s, head, head_dim]
+        new_shape = (seq_len, self.num_attention_heads_per_partition,
+                     self.hidden_size_per_attention_head)
+        q, k, v = (x.view(*new_shape) for x in (q, k, v))
+        return q, k, v
 
     def construct(  
         self,
@@ -229,9 +220,7 @@ class Qwen2_5_VisionAttention(nn.Cell):
     ) -> ms.Tensor:
         seq_length = x.shape[0]
         x, _ = self.qkv(x)
-        x = mint.reshape(x, (seq_length, 3, self.num_heads, -1))
-        x = mint.permute(x, (1, 0, 2, 3))
-        q, k, v = mint.unbind(x, dim=0)
+        q, k, v = self.split_qkv(x)
 
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_flashatt(mint.unsqueeze(q, 0), mint.unsqueeze(k, 0), cos, sin)
@@ -243,7 +232,7 @@ class Qwen2_5_VisionAttention(nn.Cell):
             q,
             k,
             v,
-            self.num_heads,
+            self.num_heads // self.tp_size,
             actual_seq_qlen=cu_seqlens,
             actual_seq_kvlen=cu_seqlens,
             scalar_value=1 / math.sqrt(q.shape[-1]),
@@ -534,7 +523,7 @@ class Qwen2_5_VisionTransformer(nn.Cell):
         rotary_pos_emb = rotary_pos_emb.reshape(
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(1, seq_len, 1, -1)
         emb = mint.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (mint.cos(emb),  mint.sin(emb))
 
@@ -585,32 +574,6 @@ class Qwen2_5_VisionTransformer(nn.Cell):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-
-class Qwen2_5_VLProcessingInfo(Qwen2VLProcessingInfo):
-
-    def get_hf_config(self):
-        return self.ctx.get_hf_config(Qwen2_5_VLConfig)
-
-    def get_hf_processor(
-        self,
-        *,
-        min_pixels: Optional[int] = None,
-        max_pixels: Optional[int] = None,
-        size: Optional[dict[str, int]] = None,
-        fps: Optional[Union[float, List[float]]] = None,
-        **kwargs: object,
-    ) -> Qwen2_5_VLProcessor:
-        if fps is not None:
-            kwargs["fps"] = fps
-
-        return self.ctx.get_hf_processor(
-            Qwen2_5_VLProcessor,
-            image_processor=self.get_image_processor(min_pixels=min_pixels,
-                                                     max_pixels=max_pixels,
-                                                     size=size),
-            **kwargs,
-        )
 
 
 class Qwen2_5_VLMultiModalProcessor(_Qwen2VLMultiModalProcessor):

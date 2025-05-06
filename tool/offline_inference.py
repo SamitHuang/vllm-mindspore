@@ -39,6 +39,7 @@ def main(args):
     llm = LLM(model=model_path,
             max_model_len=32768,
             max_num_seqs=8,
+            tensor_parallel_size=args.tp_size,
             )
 
     # Generate texts from the prompts. The output is a list of RequestOutput objects
@@ -60,6 +61,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, default="/home/mikecheung/model/Qwen2.5-VL-3B-Instruct")
     parser.add_argument("--image_path", type=str, default="/home/hyx/vllm/vllm-mindspore/demo.jpeg")
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--tp_size", type=int, default=1)
     args, _ = parser.parse_known_args()
 
     # ms.set_context(pynative_synchronize=True)

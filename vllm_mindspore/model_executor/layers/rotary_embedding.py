@@ -405,7 +405,6 @@ def get_rope(
     scaling_type = rope_scaling["rope_type"]
     if scaling_type == "default":
         if "mrope_section" in rope_scaling:
-            print("Using MRoPE.")
             rotary_emb = InferMRotaryEmbedding(
                 head_size,
                 rotary_dim,
