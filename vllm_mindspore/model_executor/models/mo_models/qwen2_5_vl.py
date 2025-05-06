@@ -36,7 +36,6 @@ import mindspore.ops as ops
 import mindspore.mint.nn.functional as F
 
 from transformers import BatchFeature
-from transformers.models.qwen2_5_vl import Qwen2_5_VLProcessor
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 
 from vllm_mindspore.model_executor.sampling_metadata import SamplingMetadata
@@ -55,8 +54,8 @@ from vllm_mindspore.utils import STR_DTYPE_TO_MS_DTYPE
 
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_vl import Qwen2VLDummyInputsBuilder as Qwen2_5_VLDummyInputsBuilder
-from vllm.model_executor.models.qwen2_vl import Qwen2VLMultiModalProcessor, Qwen2VLProcessingInfo
-from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLImageInputs, Qwen2_5_VLVideoInputs, Qwen2_5_VLImagePixelInputs, Qwen2_5_VLImageEmbeddingInputs, Qwen2_5_VLVideoPixelInputs, Qwen2_5_VLVideoEmbeddingInputs
+from vllm.model_executor.models.qwen2_vl import Qwen2VLMultiModalProcessor
+from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLImageInputs, Qwen2_5_VLVideoInputs, Qwen2_5_VLImagePixelInputs, Qwen2_5_VLImageEmbeddingInputs, Qwen2_5_VLVideoPixelInputs, Qwen2_5_VLVideoEmbeddingInputs, Qwen2_5_VLProcessingInfo
 from vllm.attention import AttentionMetadata
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -585,32 +584,6 @@ class Qwen2_5_VisionTransformer(nn.Cell):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-
-class Qwen2_5_VLProcessingInfo(Qwen2VLProcessingInfo):
-
-    def get_hf_config(self):
-        return self.ctx.get_hf_config(Qwen2_5_VLConfig)
-
-    def get_hf_processor(
-        self,
-        *,
-        min_pixels: Optional[int] = None,
-        max_pixels: Optional[int] = None,
-        size: Optional[dict[str, int]] = None,
-        fps: Optional[Union[float, List[float]]] = None,
-        **kwargs: object,
-    ) -> Qwen2_5_VLProcessor:
-        if fps is not None:
-            kwargs["fps"] = fps
-
-        return self.ctx.get_hf_processor(
-            Qwen2_5_VLProcessor,
-            image_processor=self.get_image_processor(min_pixels=min_pixels,
-                                                     max_pixels=max_pixels,
-                                                     size=size),
-            **kwargs,
-        )
 
 
 class Qwen2_5_VLMultiModalProcessor(_Qwen2VLMultiModalProcessor):
