@@ -63,7 +63,8 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargs
 from vllm.multimodal.processing import PromptReplacement
 from vllm.multimodal.parse import MultiModalDataItems
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank, tensor_model_parallel_all_gather
+from vllm.distributed import utils as dist_utils
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import uses_mrope
 
@@ -201,12 +202,10 @@ class Qwen2_5_VisionAttention(nn.Cell):
     ) -> None:
         super().__init__()
         # Per attention head and per partition values.
-        # TODO: support TP
-        self.tp_size = 1
-        self.tp_rank = 1
-        # TODO: use dist_utils.divide
-        self.hidden_size_per_attention_head = projection_size // num_heads
-        self.num_attention_heads_per_partition = num_heads // self.tp_size
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.hidden_size_per_attention_head = dist_utils.divide(projection_size, num_heads)
+        self.num_attention_heads_per_partition = dist_utils.divide(num_heads, self.tp_size)
         self.num_heads = num_heads
 
         self.qkv = ColumnParallelLinear(input_size=embed_dim,
@@ -219,6 +218,29 @@ class Qwen2_5_VisionAttention(nn.Cell):
                                       quant_config=quant_config,
                                       prefix=f"{prefix}.proj",
                                       params_dtype=ms.bfloat16)
+        
+    def split_qkv(self, qkv: ms.Tensor) -> tuple[ms.Tensor, ...]:
+        # [s, 3 * head * head_dim]
+        seq_len, _ = qkv.shape
+        if self.tp_size > 1:
+            qkv = tensor_model_parallel_all_gather(qkv)
+
+        # [s, 3 * head * head_dim] -> 3 * [s, head * head_dim]
+        q, k, v = mint.chunk(qkv, 3, dim=-1)
+
+        # 3 * [s, head * head_dim]
+        if self.tp_size > 1:
+            splitter = partial(dist_utils.split_tensor_along_last_dim,
+                               num_partitions=self.tp_size)
+            q = splitter(q)[self.tp_rank]
+            k = splitter(k)[self.tp_rank]
+            v = splitter(v)[self.tp_rank]
+
+        # 3 * [s, head * head_dim] -> 3 * [s, head, head_dim]
+        new_shape = (seq_len, self.num_attention_heads_per_partition,
+                     self.hidden_size_per_attention_head)
+        q, k, v = (x.view(*new_shape) for x in (q, k, v))
+        return q, k, v
 
     def construct(  
         self,
@@ -228,9 +250,7 @@ class Qwen2_5_VisionAttention(nn.Cell):
     ) -> ms.Tensor:
         seq_length = x.shape[0]
         x, _ = self.qkv(x)
-        x = mint.reshape(x, (seq_length, 3, self.num_heads, -1))
-        x = mint.permute(x, (1, 0, 2, 3))
-        q, k, v = mint.unbind(x, dim=0)
+        q, k, v = self.split_qkv(x)
 
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_flashatt(mint.unsqueeze(q, 0), mint.unsqueeze(k, 0), cos, sin)
@@ -242,7 +262,7 @@ class Qwen2_5_VisionAttention(nn.Cell):
             q,
             k,
             v,
-            self.num_heads,
+            self.num_heads // self.tp_size,
             actual_seq_qlen=cu_seqlens,
             actual_seq_kvlen=cu_seqlens,
             scalar_value=1 / math.sqrt(q.shape[-1]),
