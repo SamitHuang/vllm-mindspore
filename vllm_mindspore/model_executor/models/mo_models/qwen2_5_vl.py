@@ -154,40 +154,10 @@ class Qwen2_5_VisionMLP(nn.Cell):
         return x_down
 
 
-def rotate_half_flashatt(x: ms.Tensor, interleaved: bool = False) -> ms.Tensor:
-    if not interleaved:
-        x1, x2 = mint.chunk(x, 2, dim=-1)
-        return mint.cat((-x2, x1), dim=-1)
-    else:
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        return mint.stack((-x2, x1), dim=-1).flatten(-2)
-
-
-def apply_rotary_emb_flashatt(x: ms.Tensor, cos: ms.Tensor, sin: ms.Tensor, interleaved: bool = False) -> ms.Tensor:
-    """
-    x: (batch_size, seqlen, nheads, headdim)
-    cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
-    """
-    ro_dim = cos.shape[-1] * 2
-    assert ro_dim <= x.shape[-1]
-    if not interleaved:
-        cos = mint.tile(cos[:, None, :], (1, 1, 2))
-        sin = mint.tile(sin[:, None, :], (1, 1, 2))
-    else:
-        cos = mint.repeat_interleave(cos[:, None, :], (1, 1, 2))
-        sin = mint.repeat_interleave(sin[:, None, :], (1, 1, 2))
-    return mint.cat(
-        [x[..., :ro_dim] * cos + rotate_half_flashatt(x[..., :ro_dim], interleaved) * sin, x[..., ro_dim:]], dim=-1
-    )
-
-
 def apply_rotary_pos_emb_flashatt(q: ms.Tensor, k: ms.Tensor, cos: ms.Tensor, sin: ms.Tensor) -> Tuple[ms.Tensor, ms.Tensor]:
-    cos, _ = mint.chunk(cos, 2, dim=-1)
-    sin, _ = mint.chunk(sin, 2, dim=-1)
-    q_embed = apply_rotary_emb_flashatt(q.float(), cos, sin).type_as(q)
-    k_embed = apply_rotary_emb_flashatt(k.float(), cos, sin).type_as(k)
+    q_embed = ops.rotary_position_embedding(q.float(), cos, sin).type_as(q)
+    k_embed = ops.rotary_position_embedding(k.float(), cos, sin).type_as(k)
     return q_embed, k_embed
-
 
 
 class Qwen2_5_VisionAttention(nn.Cell):
@@ -553,7 +523,7 @@ class Qwen2_5_VisionTransformer(nn.Cell):
         rotary_pos_emb = rotary_pos_emb.reshape(
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(1, seq_len, 1, -1)
         emb = mint.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (mint.cos(emb),  mint.sin(emb))
 
