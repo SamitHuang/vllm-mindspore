@@ -1,6 +1,6 @@
 export ASCEND_RT_VISIBLE_DEVICES=7
 
-export PYTHONPATH=/home/hyx/vllm/vllm-mindspore:$PYTHONPATH
+export PYTHONPATH=$(pwd):$PYTHONPATH
 # set path to mindone
 export PYTHONPATH=/home/hyx/vllm/mindone:$PYTHONPATH
 

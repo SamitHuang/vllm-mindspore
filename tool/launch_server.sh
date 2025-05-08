@@ -1,5 +1,5 @@
 export ASCEND_RT_VISIBLE_DEVICES=5
-export PYTHONPATH=/home/hyx/vllm/vllm-mindspore:$PYTHONPATH
+export PYTHONPATH=$(pwd):$PYTHONPATH
 
 # backend 
 # unset vLLM_MODEL_BACKEND

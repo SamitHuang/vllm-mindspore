@@ -25,9 +25,9 @@ from typing import Callable, TypeVar
 
 import cloudpickle
 
-from vllm_mindspore.utils import is_mindformers_model_backend, is_mindone_model_backend
-
 from vllm.model_executor.models.registry import _ModelRegistry, _LazyRegisteredModel
+
+from vllm_mindspore.utils import is_mindformers_model_backend, is_mindone_model_backend
 
 _MINDSPORE_MODELS = {
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
@@ -43,7 +43,7 @@ _MINDFORMERS_MODELS = {
 
 _MINDONE_MODELS = {
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
-    "Qwen2_5_VLForConditionalGeneration": {"qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"}
+    "Qwen2_5_VLForConditionalGeneration": ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration")
 }
 
 def get_model_info():
