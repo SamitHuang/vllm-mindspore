@@ -401,30 +401,40 @@ def get_rope(
            rope_scaling_args, dtype)
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
-    
-    scaling_type = rope_scaling["rope_type"]
-    if scaling_type == "default":
-        if "mrope_section" in rope_scaling:
-            rotary_emb = InferMRotaryEmbedding(
-                head_size,
-                rotary_dim,
-                max_position,
-                base,
-                is_neox_style,
-                dtype,
-                mrope_section=rope_scaling["mrope_section"],
-            )
-            _ROPE_DICT[key] = rotary_emb
-            return rotary_emb
 
-    rotary_emb = InferRotaryEmbedding(
-        head_size,
-        rotary_dim,
-        max_position,
-        base,
-        is_neox_style,
-        dtype,
-    )
+    if rope_scaling is None:
+        rotary_emb = InferRotaryEmbedding(
+            head_size,
+            rotary_dim,
+            max_position,
+            base,
+            is_neox_style,
+            dtype,
+        )
+    else:
+        scaling_type = rope_scaling["rope_type"]
+        if scaling_type == "default":
+            if "mrope_section" in rope_scaling:
+                rotary_emb = InferMRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                )
+            else:
+                rotary_emb = InferRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                )
+        else:
+            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
 
