@@ -652,7 +652,8 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
 
         self.model = Qwen2Model(vllm_config=vllm_config,
                                 prefix=maybe_prefix(prefix, "model"))
-        
+        self.model.embed_tokens.set_inputs(ms.Tensor(shape=[None], dtype=ms.int64))
+
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
