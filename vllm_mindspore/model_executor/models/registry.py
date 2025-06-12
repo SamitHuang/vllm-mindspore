@@ -43,7 +43,8 @@ _MINDFORMERS_MODELS = {
 
 _MINDONE_MODELS = {
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
-    "Qwen2_5_VLForConditionalGeneration": ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration")
+    "Qwen2_5_VLForConditionalGeneration": ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),
+    "OPTForCausalLM": ("opt", "OPTForCausalLM"),
 }
 
 def get_model_info():
