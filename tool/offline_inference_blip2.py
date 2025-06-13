@@ -1,28 +1,12 @@
 import vllm_mindspore # Add this line on the top of script.
-from transformers import AutoProcessor
 from PIL import Image
 from vllm import LLM, SamplingParams
-import mindspore as ms
 
 
 def main(args):
     model_path = args.model_path
-    processor = AutoProcessor.from_pretrained(model_path)
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": "demo.jpeg",
-                },
-                {"type": "text", "text": "Describe this image."},
-            ],
-        }
-    ]
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+
+    text = "Question: Describe this image. Answer:"
 
     print("========== input =========")
     print(text)
@@ -37,7 +21,6 @@ def main(args):
 
     # Create an LLM.
     llm = LLM(model=model_path,
-            max_model_len=32768,
             max_num_seqs=8,
             tensor_parallel_size=args.tp_size,
             )
@@ -58,11 +41,10 @@ def main(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="test")
-    parser.add_argument("--model_path", type=str, default="/home/mikecheung/model/Qwen2.5-VL-3B-Instruct")
-    parser.add_argument("--image_path", type=str, default="/home/hyx/vllm/vllm-mindspore/demo.jpeg")
+    parser.add_argument("--model_path", type=str, default="/home/mikecheung/model/blip2-opt-2.7b")
+    parser.add_argument("--image_path", type=str, default="demo.jpeg")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--tp_size", type=int, default=1)
     args, _ = parser.parse_known_args()
 
-    # ms.set_context(pynative_synchronize=True)
     main(args)

@@ -1098,24 +1098,9 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
 
         dyn_num_prefill_tokens = ms.mutable(1)
         dyn_num_decode_tokens = ms.mutable(0)
-        dyn_batch_valid_length = ms.Tensor(
-            shape=[
-                None,
-            ],
-            dtype=ms.int32,
-        )
-        dyn_q_seq_lens = ms.Tensor(
-            shape=[
-                None,
-            ],
-            dtype=ms.int32,
-        )
-        dyn_slot_mapping = ms.Tensor(
-            shape=[
-                None,
-            ],
-            dtype=ms.int32,
-        )
+        dyn_batch_valid_length = ms.Tensor(shape=[None], dtype=ms.int32)
+        dyn_q_seq_lens = ms.Tensor(shape=[None], dtype=ms.int32)
+        dyn_slot_mapping = ms.Tensor(shape=[None], dtype=ms.int32)
         dyn_block_tables = ms.Tensor(shape=[None, None], dtype=ms.int32)
         dyn_intermediate_tensors = None
 

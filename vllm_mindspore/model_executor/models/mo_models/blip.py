@@ -314,7 +314,7 @@ class BlipVisionModel(nn.Cell):
             require_post_norm = len(self.encoder.layers) == num_hidden_layers
 
         if require_post_norm:
-            self.post_layernorm = nn.LayerNorm(
+            self.post_layernorm = mint.nn.LayerNorm(
                 config.hidden_size, eps=config.layer_norm_eps, dtype=ms.bfloat16
             )
         else:

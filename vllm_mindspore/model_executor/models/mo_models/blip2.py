@@ -7,6 +7,7 @@ from typing import Callable, Iterable, List, Optional, Set, Tuple, Union
 import mindspore as ms
 import mindspore.mint as mint
 import mindspore.nn as nn
+import numpy as np
 from transformers import Blip2QFormerConfig
 from vllm.attention import AttentionMetadata
 from vllm.config import CacheConfig, VllmConfig
@@ -28,15 +29,17 @@ from vllm_mindspore.model_executor.layers.quantization.base_config import (
 from vllm_mindspore.model_executor.layers.activation import get_act_fn
 from vllm_mindspore.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm_mindspore.model_executor.models.interfaces import SupportsMultiModal
-from vllm_mindspore.model_executor.models.model_base import MsModelBase
+from vllm_mindspore.model_executor.models.model_base import Fake_Attention, MsModelBase
 from vllm_mindspore.model_executor.models.utils import (
     maybe_prefix,
     merge_multimodal_embeddings,
 )
 from vllm_mindspore.model_executor.sampling_metadata import SamplingMetadata
+from vllm_mindspore.utils import STR_DTYPE_TO_MS_DTYPE
+from vllm_mindspore.model_executor.model_loader.weight_utils import default_weight_loader
 
 from .blip import BlipVisionModel
-from .opt import OPTModel
+from .opt import OPTForCausalLM
 
 
 def apply_chunking_to_forward(
@@ -430,7 +433,7 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         self.vision_model = BlipVisionModel(config.vision_config, quant_config)
 
         self.query_tokens = ms.Parameter(
-            mint.zeros(1, config.num_query_tokens, config.qformer_config.hidden_size)
+            mint.zeros((1, config.num_query_tokens, config.qformer_config.hidden_size))
         )
 
         self.qformer = Blip2QFormerModel(
@@ -444,15 +447,30 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
             dtype=ms.bfloat16,
         )
 
-        self.language_model = OPTModel(
+        vllm_config = vllm_config.with_hf_config(config.text_config)
+        self.language_model = OPTForCausalLM(
             vllm_config=vllm_config,
-            hf_config=config.text_config,
             prefix=maybe_prefix(prefix, "language_model"),
         )
+        self.language_model.model.decoder.embed_tokens.set_inputs(ms.Tensor(shape=[None], dtype=ms.int64))
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+
+        self.set_modules(
+            {"vision_model": self.vision_model, "qformer": self.qformer, "query_tokens": self.query_tokens, "language_projection": self.language_projection, "language_model": self.language_model}
+        )
+
+        self.kv_caches = [Fake_Attention() for i in range(config.get_text_config().num_hidden_layers)]
+        compilation_config = vllm_config.compilation_config
+
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        for i in range(config.get_text_config().num_hidden_layers):
+            compilation_config.static_forward_context[str(i)] = self.kv_caches[i]
+
+        self.decode_first_time = True
 
     @cached_property
     def sampler(self):
@@ -540,7 +558,7 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         assert self.vision_model is not None
         image_features = self._process_image_pixels(image_input)
 
-        query_tokens = self.query_tokens.expand(image_features.shape[0], -1, -1)
+        query_tokens = self.query_tokens.expand((image_features.shape[0], -1, -1))
         query_output = self.qformer(
             query_embeds=query_tokens,
             encoder_hidden_states=image_features,
@@ -566,6 +584,81 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
                 input_ids, inputs_embeds, multimodal_embeddings, _IMAGE_TOKEN_ID
             )
         return inputs_embeds
+    
+    def set_model_inputs(
+        self,
+        input_ids: Optional[ms.Tensor] = None,
+        position_ids: Optional[ms.Tensor] = None,
+        inputs_embeds: Optional[ms.Tensor] = None,
+    ):
+        if input_ids is None:
+            dyn_input_ids = None
+        else:
+            dyn_input_ids = ms.Tensor(
+                shape=[None] * input_ids.ndim, dtype=input_ids.dtype
+            )
+
+        if position_ids is None:
+            dyn_position_ids = None
+        else:
+            dyn_position_ids = ms.Tensor(
+                shape=[None] * position_ids.ndim, dtype=position_ids.dtype
+            )
+
+        if inputs_embeds is None:
+            dyn_inputs_embeds = None
+        else:
+            dyn_inputs_embeds = ms.Tensor(
+                shape=[None] * inputs_embeds.ndim, dtype=inputs_embeds.dtype
+            )
+
+        block_size = self.cache_config.block_size
+        num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
+        head_size = self.model_config.get_head_size()
+        kv_cache_shape = (None, block_size, num_kv_heads, head_size)
+
+        kv_cache_dtype = (
+            self.model_config.dtype
+            if self.cache_config.cache_dtype == "auto"
+            else self.cache_config.cache_dtype
+        )
+        kv_cache_dtype = STR_DTYPE_TO_MS_DTYPE[kv_cache_dtype]
+
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+
+        dyn_key_cache = ms.mutable(
+            ms.Tensor(shape=kv_cache_shape, dtype=kv_cache_dtype)
+        )
+        dyn_value_cache = ms.mutable(
+            ms.Tensor(shape=kv_cache_shape, dtype=kv_cache_dtype)
+        )
+        dyn_key_caches = ms.mutable([dyn_key_cache for _ in range(num_layers)])
+        dyn_value_caches = ms.mutable([dyn_value_cache for _ in range(num_layers)])
+
+        dyn_num_prefill_tokens = ms.mutable(1)
+        dyn_num_decode_tokens = ms.mutable(0)
+        dyn_batch_valid_length = ms.Tensor(shape=[None], dtype=ms.int32)
+        dyn_q_seq_lens = ms.Tensor(shape=[None], dtype=ms.int32)
+        dyn_slot_mapping = ms.Tensor(shape=[None], dtype=ms.int32)
+        dyn_block_tables = ms.Tensor(shape=[None, None], dtype=ms.int32)
+        dyn_intermediate_tensors = None
+
+        self.language_model.model.set_inputs(
+            dyn_input_ids,
+            dyn_position_ids,
+            dyn_key_caches,
+            dyn_value_caches,
+            dyn_num_prefill_tokens,
+            dyn_num_decode_tokens,
+            dyn_batch_valid_length,
+            dyn_q_seq_lens,
+            dyn_slot_mapping,
+            dyn_block_tables,
+            dyn_intermediate_tensors,
+            dyn_inputs_embeds,
+        )
+
+        self.language_model.lm_head.set_inputs(ms.Tensor(shape=[None], dtype=ms.int64))
 
     def forward(
         self,
@@ -577,36 +670,18 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         inputs_embeds: Optional[ms.Tensor] = None,
         **kwargs: object,
     ) -> Union[SamplerOutput, IntermediateTensors]:
-        """Run forward pass for BLIP-2.
+        key_cache, value_cache = self.get_kvcache()
 
-        One key thing to understand is the `input_ids` already accounts for the
-        positions of the to-be-inserted image embeddings.
-
-        Concretely, consider a text prompt:
-        `"Question: What's the content of the image? Answer:"`.
-
-        Tokenizer outputs:
-        `[2, 45641, 35, 653, 18, 5, 1383, 9, 5, 2274, 116, 31652, 35]`.
-
-        To reserve space in KV cache, we have to insert placeholder tokens
-        before they are inputted to the model, so the input processor prepends
-        dummy tokens (denoted as `50265`), resulting in:
-        `[50265, ..., 50265, 2, 45641, 35, ..., 31652, 35]`.
-
-        We insert 32 tokens since it corresponds to the number of query
-        embeddings outputted by the Q-Former and inputted to the language model.
-
-        This way, the `positions` and `attn_metadata` are consistent
-        with the `input_ids`.
-
-        Args:
-            input_ids: Flattened (concatenated) input_ids corresponding to a
-                batch.
-            pixel_values: The pixels in each input image.
-
-        See also:
-            :class:`Blip2ImageInputs`
-        """
+        num_prefill_tokens = ms.mutable(attn_metadata.num_prefill_tokens)
+        num_decode_tokens = ms.mutable(attn_metadata.num_decode_tokens)
+        slot_mapping = attn_metadata.slot_mapping
+        batch_valid_length = ms.Tensor.from_numpy(
+            np.array(attn_metadata.seq_lens, dtype=np.int32)
+        )
+        q_seq_lens = ms.Tensor.from_numpy(
+            np.array(attn_metadata.query_lens, dtype=np.int32)
+        )
+        block_tables = attn_metadata.block_tables
 
         if intermediate_tensors is not None:
             inputs_embeds = None
@@ -618,16 +693,37 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
             inputs_embeds = self.get_input_embeddings(input_ids, vision_embeddings)
             input_ids = None
 
-        hidden_states = self.language_model.model(
+        if attn_metadata.num_prefill_tokens > 0:
+            inputs_embeds = inputs_embeds.expand_dims(0)
+            self.set_model_inputs(input_ids, positions, inputs_embeds)
+            self.decode_first_time = True
+        if attn_metadata.num_decode_tokens > 0:
+            input_ids = input_ids.expand_dims(1)
+            if self.decode_first_time:
+                self.set_model_inputs(input_ids, positions, inputs_embeds)
+                self.decode_first_time = False
+
+        model_output = self.language_model.model(
             input_ids,
             positions,
-            kv_caches,
-            attn_metadata,
+            key_cache,
+            value_cache,
+            num_prefill_tokens,
+            num_decode_tokens,
+            slot_mapping,
+            batch_valid_length,
+            q_seq_lens,
+            block_tables,
             intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
 
-        return hidden_states
+        if attn_metadata.num_prefill_tokens > 0:
+            model_output = model_output.squeeze(0)
+        if attn_metadata.num_decode_tokens > 0:
+            model_output = model_output.squeeze(1)
+
+        return model_output
 
     def compute_logits(
         self,
@@ -648,5 +744,9 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         for name, weight in weights:
             if "vision_model." in name:
                 self.vision_model.load_weights([(name, weight)], params_dict)
+            elif "language_model." in name:
+                self.language_model.load_weights([(name.replace("language_model.", ""), weight.to(ms.float16))])
             else:
-                raise NotImplementedError()
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight)

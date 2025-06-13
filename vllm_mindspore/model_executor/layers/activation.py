@@ -59,6 +59,8 @@ class SwiGLU(nn.Cell):
 
 
 _ACTIVATION_REGISTRY = LazyDict({
+    "gelu":
+    lambda: mint.nn.GELU(),
     "relu":
     lambda: mint.nn.ReLU(),
     "silu":
