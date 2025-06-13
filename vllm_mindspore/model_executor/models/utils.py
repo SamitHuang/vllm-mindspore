@@ -258,7 +258,7 @@ def get_pp_missing_layer_names(model: nn.Cell) -> List[str]:
         return _model_to_pp_missing_layer_names[model_id]
 
     missing_layer_names = []
-    for name, module in model.cells_and_names():
+    for name, module in model.named_modules():
         if isinstance(module, PPMissingLayer):
             # NOTE: the trailing dot is used to match the prefix of the layer.
             # without the dot, we could match a layer that is not missing,

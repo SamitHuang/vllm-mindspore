@@ -36,7 +36,7 @@ from mindspore import dtype as mstype
 from vllm_mindspore.utils import STR_DTYPE_TO_MS_DTYPE
 
 class Fake_Attention:
-    def __init__(self):
+    def __init__(self, dtype=torch.bfloat16):
         vllm_config = get_current_vllm_config()
         block_size = vllm_config.cache_config.block_size
         num_kv_heads = vllm_config.model_config.get_num_kv_heads(
@@ -47,8 +47,8 @@ class Fake_Attention:
         self.kv_shape = [num_block, block_size, num_kv_heads, head_size]
         self.kv_cache = [
             (
-                torch.zeros(self.kv_shape, dtype=torch.bfloat16, device="Ascend"),
-                torch.zeros(self.kv_shape, dtype=torch.bfloat16, device="Ascend"),
+                torch.zeros(self.kv_shape, dtype=dtype, device="Ascend"),
+                torch.zeros(self.kv_shape, dtype=dtype, device="Ascend"),
             )
             for _ in range(vllm_config.parallel_config.pipeline_parallel_size)
         ]

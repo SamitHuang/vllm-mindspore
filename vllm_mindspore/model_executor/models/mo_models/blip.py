@@ -10,6 +10,7 @@ import mindspore.nn as nn
 import mindspore.ops as ops
 from transformers import Blip2VisionConfig, BlipVisionConfig
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm_mindspore.model_executor.layers.activation import get_act_fn
 from vllm_mindspore.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -21,8 +22,6 @@ from vllm_mindspore.model_executor.layers.quantization.base_config import (
 from vllm_mindspore.model_executor.model_loader.weight_utils import (
     default_weight_loader,
 )
-
-_ACTIVATION_REGISTRY = {}
 
 
 def get_blip_patch_grid_length(*, image_size: int, patch_size: int) -> int:
@@ -170,7 +169,7 @@ class BlipMLP(nn.Cell):
 
         self.config = config
 
-        self.activation_fn = _ACTIVATION_REGISTRY[config.hidden_act]
+        self.activation_fn = get_act_fn(config.hidden_act)
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,

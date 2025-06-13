@@ -24,58 +24,96 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2.5-VL model compatible with HuggingFace weights."""
-from functools import partial
-from typing import Callable, Iterable, List, Mapping, Optional, Set, Tuple, Union, Dict, Any
-
-import numpy as np
 import math
+from functools import partial
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
+
 import mindspore as ms
-import mindspore.nn as nn
 import mindspore.mint as mint
-import mindspore.ops as ops
 import mindspore.mint.nn.functional as F
-
+import mindspore.nn as nn
+import mindspore.ops as ops
+import numpy as np
 from transformers import BatchFeature
-from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
-
-from vllm_mindspore.model_executor.sampling_metadata import SamplingMetadata
-from vllm_mindspore.model_executor.layers.layernorm import RMSNorm
-from vllm_mindspore.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
-from vllm_mindspore.model_executor.layers.logits_processor import LogitsProcessor
-from vllm_mindspore.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm_mindspore.model_executor.layers.sampler import SamplerOutput, get_sampler
-from vllm_mindspore.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm_mindspore.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm_mindspore.model_executor.models.model_base import MsModelBase, Fake_Attention
-from vllm_mindspore.model_executor.models.interfaces import SupportsMultiModal
-from vllm_mindspore.model_executor.models.qwen2 import Qwen2Model
-from vllm_mindspore.model_executor.models.utils import PPMissingLayer, WeightsMapper, maybe_prefix, merge_multimodal_embeddings
-from vllm_mindspore.utils import STR_DTYPE_TO_MS_DTYPE
-
-from vllm.model_executor.models.module_mapping import MultiModelKeys
-from vllm.model_executor.models.qwen2_vl import Qwen2VLDummyInputsBuilder as Qwen2_5_VLDummyInputsBuilder
-from vllm.model_executor.models.qwen2_vl import Qwen2VLMultiModalProcessor
-from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLImageInputs, Qwen2_5_VLVideoInputs, Qwen2_5_VLImagePixelInputs, Qwen2_5_VLImageEmbeddingInputs, Qwen2_5_VLVideoPixelInputs, Qwen2_5_VLVideoEmbeddingInputs, Qwen2_5_VLProcessingInfo
+from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
+    Qwen2_5_VLConfig,
+    Qwen2_5_VLVisionConfig,
+)
 from vllm.attention import AttentionMetadata
 from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
+from vllm.distributed import utils as dist_utils
 from vllm.logger import init_logger
+from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.model_executor.models.qwen2_5_vl import (
+    Qwen2_5_VLImageEmbeddingInputs,
+    Qwen2_5_VLImageInputs,
+    Qwen2_5_VLImagePixelInputs,
+    Qwen2_5_VLProcessingInfo,
+    Qwen2_5_VLVideoEmbeddingInputs,
+    Qwen2_5_VLVideoInputs,
+    Qwen2_5_VLVideoPixelInputs,
+)
+from vllm.model_executor.models.qwen2_vl import (
+    Qwen2VLDummyInputsBuilder as Qwen2_5_VLDummyInputsBuilder,
+)
+from vllm.model_executor.models.qwen2_vl import (
+    Qwen2VLMultiModalProcessor,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargs
-from vllm.multimodal.processing import PromptReplacement
 from vllm.multimodal.parse import MultiModalDataItems
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank, tensor_model_parallel_all_gather
-from vllm.distributed import utils as dist_utils
+from vllm.multimodal.processing import PromptReplacement
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import uses_mrope
-
+from vllm_mindspore.model_executor.layers.activation import _ACTIVATION_REGISTRY
+from vllm_mindspore.model_executor.layers.layernorm import RMSNorm
+from vllm_mindspore.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
+from vllm_mindspore.model_executor.layers.logits_processor import LogitsProcessor
+from vllm_mindspore.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+)
+from vllm_mindspore.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm_mindspore.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm_mindspore.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+)
+from vllm_mindspore.model_executor.models.interfaces import SupportsMultiModal
+from vllm_mindspore.model_executor.models.model_base import Fake_Attention, MsModelBase
+from vllm_mindspore.model_executor.models.qwen2 import Qwen2Model
+from vllm_mindspore.model_executor.models.utils import (
+    PPMissingLayer,
+    WeightsMapper,
+    maybe_prefix,
+    merge_multimodal_embeddings,
+)
+from vllm_mindspore.model_executor.sampling_metadata import SamplingMetadata
+from vllm_mindspore.utils import STR_DTYPE_TO_MS_DTYPE
 
 logger = init_logger(__name__)
 
 
-_ACTIVATION_REGISTRY = {"silu": F.silu}
-
-
 # === Vision Inputs === #
+
 
 class _Qwen2VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
     def _get_prompt_replacements(
@@ -85,8 +123,7 @@ class _Qwen2VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
         out_mm_kwargs: MultiModalKwargs,
     ) -> list[PromptReplacement]:
         hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
-        image_processor = self.info.get_image_processor(
-            **hf_processor_mm_kwargs)
+        image_processor = self.info.get_image_processor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer()
         vocab = tokenizer.get_vocab()
 
@@ -108,42 +145,51 @@ class _Qwen2VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
             PromptReplacement(
                 modality=modality,
                 target=[placeholder[modality]],
-                replacement=partial(get_replacement_qwen2vl,
-                                    modality=modality),
-            ) for modality in ("image", "video")
+                replacement=partial(get_replacement_qwen2vl, modality=modality),
+            )
+            for modality in ("image", "video")
         ]
+
 
 # === Vision Encoder === #
 
 
 class Qwen2_5_VisionMLP(nn.Cell):
 
-    def __init__(self,
-                 in_features: int,
-                 hidden_features: int,
-                 bias: bool = False,
-                 act_fn: Callable[[ms.Tensor], ms.Tensor] = F.silu,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        bias: bool = False,
+        act_fn: Callable[[ms.Tensor], ms.Tensor] = F.silu,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
-        self.gate_proj = ColumnParallelLinear(in_features,
-                                              hidden_features,
-                                              bias=bias,
-                                              quant_config=quant_config,
-                                              prefix=f"{prefix}.gate_proj",
-                                              params_dtype=ms.bfloat16)
-        self.up_proj = ColumnParallelLinear(in_features,
-                                            hidden_features,
-                                            bias=bias,
-                                            quant_config=quant_config,
-                                            prefix=f"{prefix}.up_proj",
-                                            params_dtype=ms.bfloat16)
-        self.down_proj = RowParallelLinear(hidden_features,
-                                           in_features,
-                                           bias=bias,
-                                           quant_config=quant_config,
-                                           prefix=f"{prefix}.down_proj",
-                                           params_dtype=ms.bfloat16)
+        self.gate_proj = ColumnParallelLinear(
+            in_features,
+            hidden_features,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_proj",
+            params_dtype=ms.bfloat16,
+        )
+        self.up_proj = ColumnParallelLinear(
+            in_features,
+            hidden_features,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.up_proj",
+            params_dtype=ms.bfloat16,
+        )
+        self.down_proj = RowParallelLinear(
+            hidden_features,
+            in_features,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+            params_dtype=ms.bfloat16,
+        )
         self.act_fn = act_fn
 
     def construct(self, x: ms.Tensor):
@@ -154,7 +200,9 @@ class Qwen2_5_VisionMLP(nn.Cell):
         return x_down
 
 
-def apply_rotary_pos_emb_flashatt(q: ms.Tensor, k: ms.Tensor, cos: ms.Tensor, sin: ms.Tensor) -> Tuple[ms.Tensor, ms.Tensor]:
+def apply_rotary_pos_emb_flashatt(
+    q: ms.Tensor, k: ms.Tensor, cos: ms.Tensor, sin: ms.Tensor
+) -> Tuple[ms.Tensor, ms.Tensor]:
     q_embed = ops.rotary_position_embedding(q.float(), cos, sin).type_as(q)
     k_embed = ops.rotary_position_embedding(k.float(), cos, sin).type_as(k)
     return q_embed, k_embed
@@ -174,21 +222,29 @@ class Qwen2_5_VisionAttention(nn.Cell):
         # Per attention head and per partition values.
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
-        self.hidden_size_per_attention_head = dist_utils.divide(projection_size, num_heads)
-        self.num_attention_heads_per_partition = dist_utils.divide(num_heads, self.tp_size)
+        self.hidden_size_per_attention_head = dist_utils.divide(
+            projection_size, num_heads
+        )
+        self.num_attention_heads_per_partition = dist_utils.divide(
+            num_heads, self.tp_size
+        )
         self.num_heads = num_heads
 
-        self.qkv = ColumnParallelLinear(input_size=embed_dim,
-                                        output_size=3 * projection_size,
-                                        quant_config=quant_config,
-                                        prefix=f"{prefix}.qkv",
-                                        params_dtype=ms.bfloat16)
-        self.proj = RowParallelLinear(input_size=projection_size,
-                                      output_size=embed_dim,
-                                      quant_config=quant_config,
-                                      prefix=f"{prefix}.proj",
-                                      params_dtype=ms.bfloat16)
-        
+        self.qkv = ColumnParallelLinear(
+            input_size=embed_dim,
+            output_size=3 * projection_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv",
+            params_dtype=ms.bfloat16,
+        )
+        self.proj = RowParallelLinear(
+            input_size=projection_size,
+            output_size=embed_dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj",
+            params_dtype=ms.bfloat16,
+        )
+
     def split_qkv(self, qkv: ms.Tensor) -> tuple[ms.Tensor, ...]:
         # [s, 3 * head * head_dim]
         seq_len, _ = qkv.shape
@@ -200,19 +256,23 @@ class Qwen2_5_VisionAttention(nn.Cell):
 
         # 3 * [s, head * head_dim]
         if self.tp_size > 1:
-            splitter = partial(dist_utils.split_tensor_along_last_dim,
-                               num_partitions=self.tp_size)
+            splitter = partial(
+                dist_utils.split_tensor_along_last_dim, num_partitions=self.tp_size
+            )
             q = splitter(q)[self.tp_rank]
             k = splitter(k)[self.tp_rank]
             v = splitter(v)[self.tp_rank]
 
         # 3 * [s, head * head_dim] -> 3 * [s, head, head_dim]
-        new_shape = (seq_len, self.num_attention_heads_per_partition,
-                     self.hidden_size_per_attention_head)
+        new_shape = (
+            seq_len,
+            self.num_attention_heads_per_partition,
+            self.hidden_size_per_attention_head,
+        )
         q, k, v = (x.view(*new_shape) for x in (q, k, v))
         return q, k, v
 
-    def construct(  
+    def construct(
         self,
         x: ms.Tensor,
         cu_seqlens: ms.Tensor,
@@ -223,7 +283,9 @@ class Qwen2_5_VisionAttention(nn.Cell):
         q, k, v = self.split_qkv(x)
 
         cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_flashatt(mint.unsqueeze(q, 0), mint.unsqueeze(k, 0), cos, sin)
+        q, k = apply_rotary_pos_emb_flashatt(
+            mint.unsqueeze(q, 0), mint.unsqueeze(k, 0), cos, sin
+        )
 
         q = mint.squeeze(q, 0)
         k = mint.squeeze(k, 0)
@@ -259,23 +321,33 @@ class Qwen2_5_VisionBlock(nn.Cell):
             norm_layer = partial(mint.nn.LayerNorm, eps=1e-6, dtype=ms.bfloat16)
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
-        self.attn = Qwen2_5_VisionAttention(embed_dim=dim,
-                                            num_heads=num_heads,
-                                            projection_size=dim,
-                                            quant_config=quant_config,
-                                            prefix=f"{prefix}.attn")
-        self.mlp = Qwen2_5_VisionMLP(dim,
-                                     mlp_hidden_dim,
-                                     act_fn=act_fn,
-                                     bias=True,
-                                     quant_config=quant_config,
-                                     prefix=f"{prefix}.mlp")
+        self.attn = Qwen2_5_VisionAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            projection_size=dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
+        )
+        self.mlp = Qwen2_5_VisionMLP(
+            dim,
+            mlp_hidden_dim,
+            act_fn=act_fn,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
 
-    def construct(self, x: ms.Tensor, cu_seqlens: ms.Tensor,
-                  position_embeddings: Tuple[ms.Tensor, ms.Tensor]) -> ms.Tensor:
-        x = x + self.attn(self.norm1(x),
-                          cu_seqlens=cu_seqlens,
-                          position_embeddings=position_embeddings)
+    def construct(
+        self,
+        x: ms.Tensor,
+        cu_seqlens: ms.Tensor,
+        position_embeddings: Tuple[ms.Tensor, ms.Tensor],
+    ) -> ms.Tensor:
+        x = x + self.attn(
+            self.norm1(x),
+            cu_seqlens=cu_seqlens,
+            position_embeddings=position_embeddings,
+        )
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -295,17 +367,18 @@ class Qwen2_5_VisionPatchEmbed(nn.Cell):
         self.hidden_size = hidden_size
 
         kernel_size = (temporal_patch_size, patch_size, patch_size)
-        self.proj = mint.nn.Conv3d(in_channels,
-                              hidden_size,
-                              kernel_size=kernel_size,
-                              stride=kernel_size,
-                              bias=False,
-                              dtype=ms.bfloat16)
+        self.proj = mint.nn.Conv3d(
+            in_channels,
+            hidden_size,
+            kernel_size=kernel_size,
+            stride=kernel_size,
+            bias=False,
+            dtype=ms.bfloat16,
+        )
 
     def construct(self, x: ms.Tensor) -> ms.Tensor:
         L, C = x.shape
-        x = x.view(L, -1, self.temporal_patch_size, self.patch_size,
-                   self.patch_size)
+        x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
         x = self.proj(x).view(L, self.hidden_size)
         return x
 
@@ -326,21 +399,27 @@ class Qwen2_5_VisionPatchMerger(nn.Cell):
         if norm_layer is None:
             norm_layer = partial(mint.nn.LayerNorm, eps=1e-6, dtype=ms.bfloat16)
         self.ln_q = norm_layer(context_dim)
-        self.mlp = nn.CellList([
-            ColumnParallelLinear(self.hidden_size,
-                                 self.hidden_size,
-                                 bias=True,
-                                 quant_config=quant_config,
-                                 prefix=f"{prefix}.mlp.0",
-                                 params_dtype=ms.bfloat16),
-            mint.nn.GELU(),
-            RowParallelLinear(self.hidden_size,
-                              d_model,
-                              bias=True,
-                              quant_config=quant_config,
-                              prefix=f"{prefix}.mlp.2",
-                              params_dtype=ms.bfloat16),
-        ])
+        self.mlp = nn.CellList(
+            [
+                ColumnParallelLinear(
+                    self.hidden_size,
+                    self.hidden_size,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.mlp.0",
+                    params_dtype=ms.bfloat16,
+                ),
+                mint.nn.GELU(),
+                RowParallelLinear(
+                    self.hidden_size,
+                    d_model,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.mlp.2",
+                    params_dtype=ms.bfloat16,
+                ),
+            ]
+        )
 
     def construct(self, x: ms.Tensor) -> ms.Tensor:
         x = self.ln_q(x)
@@ -359,8 +438,9 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Cell):
         super().__init__()
         self.dim = dim
         self.theta = theta
-        self.inv_freq = 1.0 / (theta
-                               ** (mint.arange(0, dim, 2, dtype=ms.float32) / dim))
+        self.inv_freq = 1.0 / (
+            theta ** (mint.arange(0, dim, 2, dtype=ms.float32) / dim)
+        )
         self._seq_len_cached = 0
         self._freqs_cached = None
 
@@ -368,8 +448,9 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Cell):
         if seqlen > self._seq_len_cached:
             seqlen *= 2
             self._seq_len_cached = seqlen
-            self.inv_freq = 1.0 / (self.theta**(mint.arange
-                (0, self.dim, 2, dtype=ms.float32) / self.dim))
+            self.inv_freq = 1.0 / (
+                self.theta ** (mint.arange(0, self.dim, 2, dtype=ms.float32) / self.dim)
+            )
             seq = mint.arange(seqlen, dtype=self.inv_freq.dtype)
             freqs = mint.outer(seq, self.inv_freq)
             self._freqs_cached = freqs
@@ -415,17 +496,20 @@ class Qwen2_5_VisionTransformer(nn.Cell):
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
-        self.blocks = nn.CellList([
-            Qwen2_5_VisionBlock(
-                dim=self.hidden_size,
-                num_heads=self.num_heads,
-                mlp_hidden_dim=vision_config.intermediate_size,
-                act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
-                norm_layer=norm_layer,
-                quant_config=quant_config,
-                prefix=f"{prefix}.blocks.{layer_idx}")
-            for layer_idx in range(depth)
-        ])
+        self.blocks = nn.CellList(
+            [
+                Qwen2_5_VisionBlock(
+                    dim=self.hidden_size,
+                    num_heads=self.num_heads,
+                    mlp_hidden_dim=vision_config.intermediate_size,
+                    act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
+                    norm_layer=norm_layer,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.blocks.{layer_idx}",
+                )
+                for layer_idx in range(depth)
+            ]
+        )
         self.merger = Qwen2_5_VisionPatchMerger(
             d_model=vision_config.out_hidden_size,
             context_dim=self.hidden_size,
@@ -445,18 +529,26 @@ class Qwen2_5_VisionTransformer(nn.Cell):
             t, h, w = t.item(), h.item(), w.item()
             hpos_ids = mint.arange(h).unsqueeze(1).expand((-1, w))
             wpos_ids = mint.arange(w).unsqueeze(0).expand((h, -1))
-            hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            ).permute(0, 2, 1, 3).flatten()
-            wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            ).permute(0, 2, 1, 3).flatten()
+            hpos_ids = (
+                hpos_ids.reshape(
+                    h // self.spatial_merge_size,
+                    self.spatial_merge_size,
+                    w // self.spatial_merge_size,
+                    self.spatial_merge_size,
+                )
+                .permute(0, 2, 1, 3)
+                .flatten()
+            )
+            wpos_ids = (
+                wpos_ids.reshape(
+                    h // self.spatial_merge_size,
+                    self.spatial_merge_size,
+                    w // self.spatial_merge_size,
+                    self.spatial_merge_size,
+                )
+                .permute(0, 2, 1, 3)
+                .flatten()
+            )
             pos_ids.append(mint.tile(mint.stack([hpos_ids, wpos_ids], dim=-1), (t, 1)))
         pos_ids = mint.cat(pos_ids, dim=0)
         max_grid_size = grid_thw[:, 1:].max().item()
@@ -468,32 +560,43 @@ class Qwen2_5_VisionTransformer(nn.Cell):
         window_index: list = []
         cu_window_seqlens: list = [0]
         window_index_id = 0
-        vit_merger_window_size = (self.window_size //
-                                  self.spatial_merge_size // self.patch_size)
+        vit_merger_window_size = (
+            self.window_size // self.spatial_merge_size // self.patch_size
+        )
 
         for grid_t, grid_h, grid_w in grid_thw:
             grid_t, grid_h, grid_w = grid_t.item(), grid_h.item(), grid_w.item()
             llm_grid_h = grid_h // self.spatial_merge_size
             llm_grid_w = grid_w // self.spatial_merge_size
             index = mint.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
-                grid_t, llm_grid_h, llm_grid_w)
+                grid_t, llm_grid_h, llm_grid_w
+            )
             pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
             pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
             num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
             num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
-            index_padded = F.pad(index, (0, pad_w, 0, pad_h), 'constant', -100)
-            index_padded = index_padded.reshape(grid_t, num_windows_h,
-                                                vit_merger_window_size,
-                                                num_windows_w,
-                                                vit_merger_window_size)
+            index_padded = F.pad(index, (0, pad_w, 0, pad_h), "constant", -100)
+            index_padded = index_padded.reshape(
+                grid_t,
+                num_windows_h,
+                vit_merger_window_size,
+                num_windows_w,
+                vit_merger_window_size,
+            )
             index_padded = index_padded.permute(0, 1, 3, 2, 4).reshape(
-                grid_t, num_windows_h * num_windows_w, vit_merger_window_size,
-                vit_merger_window_size)
+                grid_t,
+                num_windows_h * num_windows_w,
+                vit_merger_window_size,
+                vit_merger_window_size,
+            )
             seqlens = (index_padded != -100).sum([2, 3]).reshape(-1)
             index_padded = index_padded.reshape(-1)
             index_new = index_padded[index_padded != -100]
             window_index.append(index_new + window_index_id)
-            cu_seqlens_tmp = mint.cumsum(seqlens, 0) * self.spatial_merge_unit + cu_window_seqlens[-1]
+            cu_seqlens_tmp = (
+                mint.cumsum(seqlens, 0) * self.spatial_merge_unit
+                + cu_window_seqlens[-1]
+            )
             cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
             window_index_id += grid_t * llm_grid_h * llm_grid_w
         window_index = mint.cat(window_index, dim=0)
@@ -517,18 +620,24 @@ class Qwen2_5_VisionTransformer(nn.Cell):
         cu_window_seqlens = mint.unique_consecutive(cu_window_seqlens)
         seq_len, _ = hidden_states.shape
         hidden_states = hidden_states.reshape(
-            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
         hidden_states = hidden_states[window_index, :, :]
         hidden_states = hidden_states.reshape(seq_len, -1)
         rotary_pos_emb = rotary_pos_emb.reshape(
-            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
         rotary_pos_emb = rotary_pos_emb.reshape(1, seq_len, 1, -1)
         emb = mint.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (mint.cos(emb),  mint.sin(emb))
+        position_embeddings = (mint.cos(emb), mint.sin(emb))
 
         # compute cu_seqlens
-        cu_seqlens = mint.cumsum(mint.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]), dim=0, dtype=ms.int32)
+        cu_seqlens = mint.cumsum(
+            mint.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]),
+            dim=0,
+            dtype=ms.int32,
+        )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
 
         # transformers
@@ -537,9 +646,11 @@ class Qwen2_5_VisionTransformer(nn.Cell):
                 cu_seqlens_now = cu_seqlens
             else:
                 cu_seqlens_now = cu_window_seqlens
-            hidden_states = blk(hidden_states,
-                                cu_seqlens=cu_seqlens_now,
-                                position_embeddings=position_embeddings)
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
+            )
 
         # adapter
         hidden_states = self.merger(hidden_states)
@@ -547,8 +658,11 @@ class Qwen2_5_VisionTransformer(nn.Cell):
         hidden_states = hidden_states[reverse_indices, :]
         return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   ms.Tensor]], params_dict: Dict[str, ms.Parameter]) -> Set[str]:
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, ms.Tensor]],
+        params_dict: Dict[str, ms.Parameter],
+    ) -> Set[str]:
         loaded_params: Set[str] = set()
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -558,7 +672,7 @@ class Qwen2_5_VisionTransformer(nn.Cell):
         ]
 
         for name, loaded_weight in weights:
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
@@ -569,8 +683,7 @@ class Qwen2_5_VisionTransformer(nn.Cell):
                 break
             else:
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
@@ -592,7 +705,8 @@ class Qwen2_5_VLMultiModalProcessor(_Qwen2VLMultiModalProcessor):
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen2_5_VLMultiModalProcessor,
     info=Qwen2_5_VLProcessingInfo,
-    dummy_inputs=Qwen2_5_VLDummyInputsBuilder)
+    dummy_inputs=Qwen2_5_VLDummyInputsBuilder,
+)
 class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -621,17 +735,19 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
         "fc2",
         # projector
         "mlp.0",
-        "mlp.2"
+        "mlp.2",
     ]
 
     embedding_modules = {}
     embedding_padding_modules = []
 
     # To ensure correct weight loading and mapping.
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={
-        "lm_head.": "language_model.lm_head.",
-        "model.": "language_model.model.",
-    })
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "lm_head.": "language_model.lm_head.",
+            "model.": "language_model.model.",
+        }
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -650,26 +766,33 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
             prefix=maybe_prefix(prefix, "visual"),
         )
 
-        self.model = Qwen2Model(vllm_config=vllm_config,
-                                prefix=maybe_prefix(prefix, "model"))
+        self.model = Qwen2Model(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
         self.model.embed_tokens.set_inputs(ms.Tensor(shape=[None], dtype=ms.int64))
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
-                self.lm_head = ParallelLMHead(config.vocab_size,
-                                              config.hidden_size,
-                                              params_dtype=ms.bfloat16,
-                                              quant_config=quant_config,
-                                              prefix=maybe_prefix(prefix, "lm_head"))
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    params_dtype=ms.bfloat16,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "lm_head"),
+                )
             self.logits_processor = LogitsProcessor(config.vocab_size)
             self.sampler = get_sampler()
         else:
             self.lm_head = PPMissingLayer()
 
-        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
-        self.set_modules({"visual": self.visual, "model": self.model, "lm_head": self.lm_head})
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+        self.set_modules(
+            {"visual": self.visual, "model": self.model, "lm_head": self.lm_head}
+        )
 
         self.kv_caches = [Fake_Attention() for i in range(config.num_hidden_layers)]
         compilation_config = vllm_config.compilation_config
@@ -688,24 +811,27 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
         #     return None
         return quant_config
 
-    def _validate_and_reshape_mm_tensor(self, mm_input: object,
-                                        name: str) -> ms.Tensor:
+    def _validate_and_reshape_mm_tensor(self, mm_input: object, name: str) -> ms.Tensor:
         if not isinstance(mm_input, (ms.Tensor, list)):
-            raise ValueError(f"Incorrect type of {name}. "
-                             f"Got type: {type(mm_input)}")
+            raise ValueError(
+                f"Incorrect type of {name}. " f"Got type: {type(mm_input)}"
+            )
         if isinstance(mm_input, ms.Tensor):
             if mm_input.ndim == 2:
                 return mm_input
             if mm_input.ndim != 3:
-                raise ValueError(f"{name} should be 2D or batched 3D tensor. "
-                                 f"Got ndim: {mm_input.ndim} "
-                                 f"(shape={mm_input.shape})")
+                raise ValueError(
+                    f"{name} should be 2D or batched 3D tensor. "
+                    f"Got ndim: {mm_input.ndim} "
+                    f"(shape={mm_input.shape})"
+                )
             return mint.concat(list(mm_input))
         else:
             return mint.concat(mm_input)
 
     def _parse_and_validate_image_input(
-            self, **kwargs: object) -> Optional[Qwen2_5_VLImageInputs]:
+        self, **kwargs: object
+    ) -> Optional[Qwen2_5_VLImageInputs]:
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
@@ -715,34 +841,46 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
 
         if pixel_values is not None:
             pixel_values = self._validate_and_reshape_mm_tensor(
-                pixel_values, "image pixel values")
+                pixel_values, "image pixel values"
+            )
             image_grid_thw = self._validate_and_reshape_mm_tensor(
-                image_grid_thw, "image grid_thw")
+                image_grid_thw, "image grid_thw"
+            )
 
             if not isinstance(pixel_values, (ms.Tensor, list)):
-                raise ValueError("Incorrect type of image pixel values. "
-                                 f"Got type: {type(pixel_values)}")
+                raise ValueError(
+                    "Incorrect type of image pixel values. "
+                    f"Got type: {type(pixel_values)}"
+                )
 
-            return Qwen2_5_VLImagePixelInputs(type="pixel_values",
-                                              pixel_values=pixel_values,
-                                              image_grid_thw=image_grid_thw)
+            return Qwen2_5_VLImagePixelInputs(
+                type="pixel_values",
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+            )
 
         if image_embeds is not None:
             image_embeds = self._validate_and_reshape_mm_tensor(
-                image_embeds, "image embeds")
+                image_embeds, "image embeds"
+            )
             image_grid_thw = self._validate_and_reshape_mm_tensor(
-                image_grid_thw, "image grid_thw")
+                image_grid_thw, "image grid_thw"
+            )
 
             if not isinstance(image_embeds, ms.Tensor):
-                raise ValueError("Incorrect type of image embeddings. "
-                                 f"Got type: {type(image_embeds)}")
+                raise ValueError(
+                    "Incorrect type of image embeddings. "
+                    f"Got type: {type(image_embeds)}"
+                )
             return Qwen2_5_VLImageEmbeddingInputs(
                 type="image_embeds",
                 image_embeds=image_embeds,
-                image_grid_thw=image_grid_thw)
+                image_grid_thw=image_grid_thw,
+            )
 
     def _parse_and_validate_video_input(
-            self, **kwargs: object) -> Optional[Qwen2_5_VLVideoInputs]:
+        self, **kwargs: object
+    ) -> Optional[Qwen2_5_VLVideoInputs]:
         pixel_values_videos = kwargs.pop("pixel_values_videos", None)
         video_embeds = kwargs.pop("video_embeds", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
@@ -753,9 +891,11 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
 
         if pixel_values_videos is not None:
             pixel_values_videos = self._validate_and_reshape_mm_tensor(
-                pixel_values_videos, "video pixel values")
+                pixel_values_videos, "video pixel values"
+            )
             video_grid_thw = self._validate_and_reshape_mm_tensor(
-                video_grid_thw, "video grid_thw")
+                video_grid_thw, "video grid_thw"
+            )
 
             return Qwen2_5_VLVideoPixelInputs(
                 type="pixel_values_videos",
@@ -766,21 +906,26 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
 
         if video_embeds is not None:
             video_embeds = self._validate_and_reshape_mm_tensor(
-                video_embeds, "video embeds")
+                video_embeds, "video embeds"
+            )
             video_grid_thw = self._validate_and_reshape_mm_tensor(
-                video_grid_thw, "video grid_thw")
+                video_grid_thw, "video grid_thw"
+            )
 
             if not isinstance(video_embeds, ms.Tensor):
-                raise ValueError("Incorrect type of video embeddings. "
-                                 f"Got type: {type(video_embeds)}")
+                raise ValueError(
+                    "Incorrect type of video embeddings. "
+                    f"Got type: {type(video_embeds)}"
+                )
             return Qwen2_5_VLVideoEmbeddingInputs(
                 type="video_embeds",
                 video_embeds=video_embeds,
-                video_grid_thw=video_grid_thw)
+                video_grid_thw=video_grid_thw,
+            )
 
     def _process_image_input(
-            self,
-            image_input: Qwen2_5_VLImageInputs) -> tuple[ms.Tensor, ...]:
+        self, image_input: Qwen2_5_VLImageInputs
+    ) -> tuple[ms.Tensor, ...]:
 
         grid_thw = image_input["image_grid_thw"]
         assert grid_thw.ndim == 2
@@ -798,8 +943,8 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
         return image_embeds.split(sizes.tolist())
 
     def _process_video_input(
-            self,
-            video_input: Qwen2_5_VLVideoInputs) -> tuple[ms.Tensor, ...]:
+        self, video_input: Qwen2_5_VLVideoInputs
+    ) -> tuple[ms.Tensor, ...]:
 
         grid_thw = video_input["video_grid_thw"]
         assert grid_thw.ndim == 2
@@ -808,7 +953,8 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
             video_embeds = video_input["video_embeds"].type(self.visual.dtype)
         else:
             pixel_values_videos = video_input["pixel_values_videos"].type(
-                self.visual.dtype)
+                self.visual.dtype
+            )
             video_embeds = self.visual(pixel_values_videos, grid_thw=grid_thw)
 
         # Split concatenated embeddings for each video item.
@@ -823,18 +969,19 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
         # Preserve the order of modalities if there are multiple of them
         # from the order of kwargs.
         for input_key in kwargs:
-            if input_key in ("pixel_values",
-                             "image_embeds") and "images" not in modalities:
-                modalities["images"] = self._parse_and_validate_image_input(
-                    **kwargs)
-            if input_key in ("pixel_values_videos",
-                             "video_embeds") and "videos" not in modalities:
-                modalities["videos"] = self._parse_and_validate_video_input(
-                    **kwargs)
+            if (
+                input_key in ("pixel_values", "image_embeds")
+                and "images" not in modalities
+            ):
+                modalities["images"] = self._parse_and_validate_image_input(**kwargs)
+            if (
+                input_key in ("pixel_values_videos", "video_embeds")
+                and "videos" not in modalities
+            ):
+                modalities["videos"] = self._parse_and_validate_video_input(**kwargs)
         return modalities
 
-    def get_multimodal_embeddings(
-            self, **kwargs) -> Optional[tuple[ms.Tensor, ...]]:
+    def get_multimodal_embeddings(self, **kwargs) -> Optional[tuple[ms.Tensor, ...]]:
 
         modalities = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not modalities:
@@ -865,8 +1012,11 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
         inputs_embeds = self.model.get_input_embeddings(input_ids)
         if multimodal_embeddings is not None:
             inputs_embeds = merge_multimodal_embeddings(
-                input_ids, inputs_embeds, multimodal_embeddings,
-                [self.config.image_token_id, self.config.video_token_id])
+                input_ids,
+                inputs_embeds,
+                multimodal_embeddings,
+                [self.config.image_token_id, self.config.video_token_id],
+            )
         return inputs_embeds
 
     def get_input_embeddings_v0(
@@ -895,44 +1045,77 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
                 placeholder_token_id=self.config.video_token_id,
             )
         return inputs_embeds
-    
-    def set_model_inputs(self, input_ids: Optional[ms.Tensor] = None, position_ids: Optional[ms.Tensor] = None, inputs_embeds: Optional[ms.Tensor] = None):
+
+    def set_model_inputs(
+        self,
+        input_ids: Optional[ms.Tensor] = None,
+        position_ids: Optional[ms.Tensor] = None,
+        inputs_embeds: Optional[ms.Tensor] = None,
+    ):
         if input_ids is None:
             dyn_input_ids = None
         else:
-            dyn_input_ids = ms.Tensor(shape=[None] * input_ids.ndim, dtype=input_ids.dtype)
-     
+            dyn_input_ids = ms.Tensor(
+                shape=[None] * input_ids.ndim, dtype=input_ids.dtype
+            )
+
         if position_ids is None:
             dyn_position_ids = None
         else:
-            dyn_position_ids = ms.Tensor(shape=[None] * position_ids.ndim, dtype=position_ids.dtype)
+            dyn_position_ids = ms.Tensor(
+                shape=[None] * position_ids.ndim, dtype=position_ids.dtype
+            )
 
         if inputs_embeds is None:
             dyn_inputs_embeds = None
         else:
-            dyn_inputs_embeds = ms.Tensor(shape=[None] * inputs_embeds.ndim, dtype=inputs_embeds.dtype)
+            dyn_inputs_embeds = ms.Tensor(
+                shape=[None] * inputs_embeds.ndim, dtype=inputs_embeds.dtype
+            )
 
         block_size = self.cache_config.block_size
         num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
         head_size = self.model_config.get_head_size()
         kv_cache_shape = (None, block_size, num_kv_heads, head_size)
 
-        kv_cache_dtype = self.model_config.dtype if self.cache_config.cache_dtype == "auto" \
+        kv_cache_dtype = (
+            self.model_config.dtype
+            if self.cache_config.cache_dtype == "auto"
             else self.cache_config.cache_dtype
+        )
         kv_cache_dtype = STR_DTYPE_TO_MS_DTYPE[kv_cache_dtype]
 
         num_layers = self.model_config.get_num_layers(self.parallel_config)
 
-        dyn_key_cache = ms.mutable(ms.Tensor(shape=kv_cache_shape, dtype=kv_cache_dtype))
-        dyn_value_cache = ms.mutable(ms.Tensor(shape=kv_cache_shape, dtype=kv_cache_dtype))
+        dyn_key_cache = ms.mutable(
+            ms.Tensor(shape=kv_cache_shape, dtype=kv_cache_dtype)
+        )
+        dyn_value_cache = ms.mutable(
+            ms.Tensor(shape=kv_cache_shape, dtype=kv_cache_dtype)
+        )
         dyn_key_caches = ms.mutable([dyn_key_cache for _ in range(num_layers)])
         dyn_value_caches = ms.mutable([dyn_value_cache for _ in range(num_layers)])
 
         dyn_num_prefill_tokens = ms.mutable(1)
         dyn_num_decode_tokens = ms.mutable(0)
-        dyn_batch_valid_length = ms.Tensor(shape=[None, ], dtype=ms.int32)
-        dyn_q_seq_lens = ms.Tensor(shape=[None, ], dtype=ms.int32)
-        dyn_slot_mapping = ms.Tensor(shape=[None, ], dtype=ms.int32)
+        dyn_batch_valid_length = ms.Tensor(
+            shape=[
+                None,
+            ],
+            dtype=ms.int32,
+        )
+        dyn_q_seq_lens = ms.Tensor(
+            shape=[
+                None,
+            ],
+            dtype=ms.int32,
+        )
+        dyn_slot_mapping = ms.Tensor(
+            shape=[
+                None,
+            ],
+            dtype=ms.int32,
+        )
         dyn_block_tables = ms.Tensor(shape=[None, None], dtype=ms.int32)
         dyn_intermediate_tensors = None
 
@@ -948,12 +1131,10 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
             dyn_slot_mapping,
             dyn_block_tables,
             dyn_intermediate_tensors,
-            dyn_inputs_embeds
+            dyn_inputs_embeds,
         )
 
-        self.lm_head.set_inputs(
-            ms.Tensor(shape=[None], dtype=ms.int64)
-        )
+        self.lm_head.set_inputs(ms.Tensor(shape=[None], dtype=ms.int64))
 
     def forward(
         self,
@@ -970,8 +1151,12 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
         num_prefill_tokens = ms.mutable(attn_metadata.num_prefill_tokens)
         num_decode_tokens = ms.mutable(attn_metadata.num_decode_tokens)
         slot_mapping = attn_metadata.slot_mapping
-        batch_valid_length = ms.Tensor.from_numpy(np.array(attn_metadata.seq_lens, dtype=np.int32))
-        q_seq_lens = ms.Tensor.from_numpy(np.array(attn_metadata.query_lens, dtype=np.int32))
+        batch_valid_length = ms.Tensor.from_numpy(
+            np.array(attn_metadata.seq_lens, dtype=np.int32)
+        )
+        q_seq_lens = ms.Tensor.from_numpy(
+            np.array(attn_metadata.query_lens, dtype=np.int32)
+        )
         block_tables = attn_metadata.block_tables
 
         if intermediate_tensors is not None:
@@ -990,11 +1175,11 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
                 if uses_mrope(self.config):
                     assert positions.ndim == 2 and positions.shape[0] == 3, (
                         "multimodal section rotary embedding requires "
-                        f"(3, seq_len) positions, but got {positions.shape}")
+                        f"(3, seq_len) positions, but got {positions.shape}"
+                    )
                 inputs_embeds = self.get_input_embeddings_v0(
-                    input_ids,
-                    image_input=image_input,
-                    video_input=video_input)
+                    input_ids, image_input=image_input, video_input=video_input
+                )
                 input_ids = None
 
         # a patch to avoid compiling different positions format between warm-up and real-run
@@ -1047,8 +1232,7 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   ms.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[Tuple[str, ms.Tensor]]) -> Set[str]:
         params_dict = self.get_params_dict()
         for name, weight in weights:
             if "visual." in name:
@@ -1063,4 +1247,5 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
         return MultiModelKeys.from_string_field(
             language_model="language_model",
             connector="visual.",
-            tower_model="visual.merger.")
+            tower_model="visual.merger.",
+        )

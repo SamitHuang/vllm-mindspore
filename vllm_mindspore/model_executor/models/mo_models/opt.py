@@ -28,8 +28,10 @@ from transformers import OPTConfig
 from vllm.attention import AttentionMetadata
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.sequence import IntermediateTensors
 from vllm_mindspore.attention import Attention
+from vllm_mindspore.model_executor.layers.activation import get_act_fn
 from vllm_mindspore.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -57,17 +59,15 @@ from vllm_mindspore.model_executor.models.utils import (
 )
 from vllm_mindspore.model_executor.sampling_metadata import SamplingMetadata
 
-_ACTIVATION_REGISTRY = {}
-
 
 class OPTLearnedPositionalEmbedding(mint.nn.Embedding):
 
-    def __init__(self, num_embeddings: int, embedding_dim: int):
+    def __init__(self, num_embeddings: int, embedding_dim: int, dtype: ms.Type):
         # OPT is set up so that if padding_idx is specified then offset the
         # embedding ids by 2 and adjust num_embeddings appropriately. Other
         # models don't have this hack
         self.offset = 2
-        super().__init__(num_embeddings + self.offset, embedding_dim)
+        super().__init__(num_embeddings + self.offset, embedding_dim, dtype=dtype)
 
     def construct(self, positions: ms.Tensor):
         return super().construct(positions + self.offset)
@@ -98,7 +98,7 @@ class OPTAttention(nn.Cell):
             self.head_dim,
             total_num_heads,
             bias=bias,
-            params_dtype=ms.bfloat16,
+            params_dtype=ms.float16,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
@@ -106,7 +106,7 @@ class OPTAttention(nn.Cell):
             embed_dim,
             embed_dim,
             bias=bias,
-            params_dtype=ms.bfloat16,
+            params_dtype=ms.float16,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
@@ -118,8 +118,8 @@ class OPTAttention(nn.Cell):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
-        self.attn_mask = mint.triu(mint.ones(size=(128, 128), dtype=ms.bfloat16), 1)
-        self.hard_mask = ms.Tensor([0], dtype=ms.bfloat16).reshape(1, 1)
+        self.attn_mask = mint.triu(mint.ones(size=(128, 128), dtype=ms.float16), 1)
+        self.hard_mask = ms.Tensor([0], dtype=ms.float16).reshape(1, 1)
 
     @ms.jit
     def construct(
@@ -180,29 +180,29 @@ class OPTDecoderLayer(nn.Cell):
         self.self_attn_layer_norm = mint.nn.LayerNorm(
             self.embed_dim,
             elementwise_affine=config.layer_norm_elementwise_affine,
-            dtype=ms.bfloat16,
+            dtype=ms.float16,
         )
         self.fc1 = ColumnParallelLinear(
             self.embed_dim,
             config.ffn_dim,
             bias=config.enable_bias,
-            params_dtype=ms.bfloat16,
+            params_dtype=ms.float16,
             quant_config=quant_config,
             prefix=f"{prefix}.fc1",
         )
-        self.activation_fn = _ACTIVATION_REGISTRY[config.activation_function]
+        self.activation_fn = get_act_fn(config.activation_function)
         self.fc2 = RowParallelLinear(
             config.ffn_dim,
             self.embed_dim,
             bias=config.enable_bias,
-            params_dtype=ms.bfloat16,
+            params_dtype=ms.float16,
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
         )
         self.final_layer_norm = mint.nn.LayerNorm(
             self.embed_dim,
             elementwise_affine=config.layer_norm_elementwise_affine,
-            dtype=ms.bfloat16,
+            dtype=ms.float16,
         )
 
     @ms.jit
@@ -272,11 +272,11 @@ class OPTDecoder(nn.Cell):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.word_embed_proj_dim,
-            params_dtype=ms.bfloat16,
+            params_dtype=ms.float16,
         )
         # Positional embeddings are replicated (not sharded).
         self.embed_positions = OPTLearnedPositionalEmbedding(
-            config.max_position_embeddings, config.hidden_size
+            config.max_position_embeddings, config.hidden_size, dtype=ms.float16
         )
 
         # Project out & in will be replicated if they exist.
@@ -285,7 +285,7 @@ class OPTDecoder(nn.Cell):
                 config.hidden_size,
                 config.word_embed_proj_dim,
                 bias=False,
-                params_dtype=ms.bfloat16,
+                params_dtype=ms.float16,
                 quant_config=quant_config,
                 prefix=f"{prefix}.project_out",
             )
@@ -297,7 +297,7 @@ class OPTDecoder(nn.Cell):
                 config.word_embed_proj_dim,
                 config.hidden_size,
                 bias=False,
-                params_dtype=ms.bfloat16,
+                params_dtype=ms.float16,
                 quant_config=quant_config,
                 prefix=f"{prefix}.project_in",
             )
@@ -312,7 +312,7 @@ class OPTDecoder(nn.Cell):
             self.final_layer_norm = mint.nn.LayerNorm(
                 config.hidden_size,
                 elementwise_affine=config.layer_norm_elementwise_affine,
-                dtype=ms.bfloat16,
+                dtype=ms.float16,
             )
         else:
             self.final_layer_norm = None
@@ -429,14 +429,14 @@ class OPTModel(nn.Cell):
         )
 
 
-class OPTForCausalLM(MsModelBase):
+class OPTForCausalLM(MsModelBase, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
@@ -448,7 +448,7 @@ class OPTForCausalLM(MsModelBase):
             self.lm_head = self.model.decoder.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.word_embed_proj_dim, params_dtype=ms.bfloat16
+                config.vocab_size, config.word_embed_proj_dim, params_dtype=ms.float16
             )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = get_sampler()
@@ -459,7 +459,9 @@ class OPTForCausalLM(MsModelBase):
         self.set_modules({"model": self.model, "lm_head": self.lm_head})
 
         self.set_model_inputs()
-        self.kv_caches = [Fake_Attention() for i in range(config.num_hidden_layers)]
+        self.kv_caches = [
+            Fake_Attention(dtype=ms.float16) for i in range(config.num_hidden_layers)
+        ]
         compilation_config = vllm_config.compilation_config
 
         if prefix in compilation_config.static_forward_context:
@@ -478,6 +480,7 @@ class OPTForCausalLM(MsModelBase):
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[ms.Tensor] = None,
+        **kwargs,
     ) -> Union[ms.Tensor, IntermediateTensors]:
         key_cache, value_cache = self.get_kvcache()
         if attn_metadata.num_prefill_tokens > 0:
@@ -495,7 +498,7 @@ class OPTForCausalLM(MsModelBase):
         )
         block_tables = attn_metadata.block_tables
 
-        hidden_states = self.model(
+        model_output = self.model(
             input_ids,
             positions,
             key_cache,
@@ -513,7 +516,7 @@ class OPTForCausalLM(MsModelBase):
             model_output = model_output.squeeze(0)
         if attn_metadata.num_decode_tokens > 0:
             model_output = model_output.squeeze(1)
-        return hidden_states
+        return model_output
 
     def compute_logits(
         self,

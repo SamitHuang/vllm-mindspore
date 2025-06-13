@@ -25,6 +25,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_mindspore.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm_mindspore.model_executor.layers.activation import get_act_fn
 from vllm_mindspore.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm_mindspore.model_executor.models.interfaces import SupportsMultiModal
 from vllm_mindspore.model_executor.models.model_base import MsModelBase
@@ -36,8 +37,6 @@ from vllm_mindspore.model_executor.sampling_metadata import SamplingMetadata
 
 from .blip import BlipVisionModel
 from .opt import OPTModel
-
-_ACTIVATION_REGISTRY = {}
 
 
 def apply_chunking_to_forward(
@@ -237,7 +236,7 @@ class Blip2QFormerIntermediate(nn.Cell):
         self.dense = nn.Linear(
             config.hidden_size, config.intermediate_size, dtype=ms.bfloat16
         )
-        self.intermediate_act_fn = _ACTIVATION_REGISTRY[config.hidden_act]
+        self.intermediate_act_fn = get_act_fn(config.hidden_act)
 
     def construct(self, hidden_states: ms.Tensor) -> ms.Tensor:
         hidden_states = self.dense(hidden_states)
@@ -417,9 +416,9 @@ class Blip2QFormerModel(nn.Cell):
 )
 class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP):
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
 
-        super().__init__()
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
