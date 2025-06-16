@@ -187,7 +187,7 @@ class BlipMLP(nn.Cell):
             prefix=f"{prefix}.fc2",
         )
 
-    def forward(self, hidden_states: ms.Tensor) -> ms.Tensor:
+    def construct(self, hidden_states: ms.Tensor) -> ms.Tensor:
         hidden_states, _ = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
         hidden_states, _ = self.fc2(hidden_states)

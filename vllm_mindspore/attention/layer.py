@@ -117,6 +117,7 @@ class Attention(nn.Cell):
         use_mla: bool = False,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        flatten: bool = True,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -130,7 +131,7 @@ class Attention(nn.Cell):
         self.head_size = head_size
         self.hidden_size_per_partition = num_heads*head_size
         self.kv_hidden_size_per_partition = num_kv_heads*head_size
-        self.flatten = True
+        self.flatten = flatten
 
         input_layout = "TH" if self.flatten else "BSH"  # pynative 下不支持拉平操作。
         scale = float(scale)
@@ -204,9 +205,10 @@ class Attention(nn.Cell):
             actual_seq_kvlen: shape = [batch_size, ]
         NOTE: Currently `PyNative` mode does not support operations in "TH" form, so it will be converted to "BSH" form.
         """
-        query = query.view(-1, self.hidden_size_per_partition)
-        key = key.view(-1, self.kv_hidden_size_per_partition)
-        value = value.view(-1, self.kv_hidden_size_per_partition)
+        if self.flatten:
+            query = query.view(-1, self.hidden_size_per_partition)
+            key = key.view(-1, self.kv_hidden_size_per_partition)
+            value = value.view(-1, self.kv_hidden_size_per_partition)
         _, _, _, output = self.flash_attention(
             query,
             key,
@@ -219,7 +221,8 @@ class Attention(nn.Cell):
             actual_seq_qlen,
             actual_seq_kvlen
         )
-        output = output.view(1, -1, self.hidden_size_per_partition)
+        if self.flatten:
+            output = output.view(1, -1, self.hidden_size_per_partition)
         return output
 
     def _run_decode_forward(

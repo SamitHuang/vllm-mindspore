@@ -117,8 +117,8 @@ class OPTAttention(nn.Cell):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            flatten=False,
         )
-        self.attn_mask = mint.triu(mint.ones(size=(128, 128), dtype=ms.float16), 1)
         self.hard_mask = ms.Tensor([0], dtype=ms.float16).reshape(1, 1)
 
     @ms.jit
@@ -136,6 +136,9 @@ class OPTAttention(nn.Cell):
     ) -> ms.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
+        attn_mask = mint.triu(
+            mint.ones(size=(1, 1, q.shape[-2], k.shape[-2]), dtype=ms.bool_), 1
+        )
         attn_output = self.attn(
             q,
             k,
@@ -148,7 +151,7 @@ class OPTAttention(nn.Cell):
             batch_valid_length,
             q_seq_lens,
             block_tables,
-            self.attn_mask,
+            attn_mask,
             self.hard_mask,
         )
         output, _ = self.out_proj(attn_output)
@@ -234,7 +237,7 @@ class OPTDecoderLayer(nn.Cell):
             q_seq_lens,
             block_tables,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = mint.add(residual, hidden_states)
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
             hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -247,7 +250,7 @@ class OPTDecoderLayer(nn.Cell):
         hidden_states, _ = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
         hidden_states, _ = self.fc2(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = mint.add(residual, hidden_states)
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
             hidden_states = self.final_layer_norm(hidden_states)
@@ -444,12 +447,9 @@ class OPTForCausalLM(MsModelBase, SupportsPP):
         self.model = OPTModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        if self.config.tie_word_embeddings:
-            self.lm_head = self.model.decoder.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size, config.word_embed_proj_dim, params_dtype=ms.float16
-            )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.word_embed_proj_dim, params_dtype=ms.float16
+        )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = get_sampler()
         self.make_empty_intermediate_tensors = (
@@ -544,8 +544,6 @@ class OPTForCausalLM(MsModelBase, SupportsPP):
         ]
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-            if "lm_head.weight" in name and self.config.tie_word_embeddings:
-                continue
             if name.startswith("decoder."):
                 name = "model." + name
 
