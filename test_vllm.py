@@ -33,6 +33,8 @@ sampling_params = SamplingParams(temperature=0.0, top_p=0.95, max_tokens=256)
 # llm = LLM(model="/home/hyx/models/Qwen/Qwen2.5_var-0.5B-Instruct")
 llm = LLM(model="/home/hyx/models/Qwen/Qwen2.5-7B-Instruct")
 # llm = LLM(model="Qwen/Qwen2.5-0.5B-Instruct")
+# llm = LLM(model="/home/mikecheung/model/opt-125m")
+# llm = LLM(model="/home/mikecheung/model/opt-350m")
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 outputs = llm.generate(prompts, sampling_params)

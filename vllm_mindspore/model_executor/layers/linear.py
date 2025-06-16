@@ -21,6 +21,7 @@ from abc import abstractmethod
 
 import numpy as np
 import mindspore as ms
+from mindspore.ops import operations as P
 from mindspore import mint, ops, Tensor
 from mindspore import Parameter
 
@@ -109,6 +110,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         input_size: int,
         output_size: int,
         params_dtype,
+        use_ops_dense: bool = False,
         **extra_weight_attrs
     ):
         weight = Parameter(
@@ -126,8 +128,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
         self.matmul = ops.MatMul(transpose_b=True)
         self.bias_add = ops.Add()
+        self.dense = P.Dense()
+        self.use_ops_dense = use_ops_dense
 
-    def apply(self,
+    def apply_(self,
               layer: ms.nn.Cell,
               x: Tensor,
               bias: Parameter = None):
@@ -138,6 +142,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
             x = self.bias_add(x, bias)
         x = x.reshape(output_shape)
         return x
+
+    def apply(self,
+              layer: ms.nn.Cell,
+              x: Tensor,
+              bias: Parameter = None):
+        if self.use_ops_dense:
+            return self.dense(x, layer.weight, bias)
+        return self.apply_(layer, x, bias=bias)
 
 
 class LinearBase(ms.nn.Cell):
@@ -205,6 +217,7 @@ class ReplicatedLinear(LinearBase):
                                          self.input_size,
                                          self.output_size,
                                          self.params_dtype,
+                                         use_ops_dense=True,
                                          weight_loader=self.weight_loader)
 
         if bias:

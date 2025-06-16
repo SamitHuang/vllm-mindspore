@@ -451,9 +451,12 @@ class OPTForCausalLM(MsModelBase, SupportsPP):
         self.model = OPTModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size, config.word_embed_proj_dim, params_dtype=ms.float16
-        )
+        if self.config.tie_word_embeddings:
+            self.lm_head = self.model.decoder.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size, config.word_embed_proj_dim, params_dtype=ms.float16
+            )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = get_sampler()
         self.make_empty_intermediate_tensors = (
@@ -548,6 +551,9 @@ class OPTForCausalLM(MsModelBase, SupportsPP):
         ]
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            if "lm_head.weight" in name and self.config.tie_word_embeddings:
+                continue
+
             if name.startswith("decoder."):
                 name = "model." + name
 
@@ -574,4 +580,7 @@ class OPTForCausalLM(MsModelBase, SupportsPP):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # no matter it is tied or not, we assume the weight is loaded.
+        loaded_params.add("lm_head.weight")
         return loaded_params
