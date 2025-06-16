@@ -351,9 +351,13 @@ class OPTDecoder(nn.Cell):
             if inputs_embeds is None:
                 inputs_embeds = self.get_input_embeddings(input_ids)
             pos_embeds = self.embed_positions(positions)
+            if num_prefill_tokens > 0:
+                pos_embeds = pos_embeds.expand_dims(0)
+            else:
+                pos_embeds = pos_embeds.expand_dims(1)
             if self.project_in is not None:
                 inputs_embeds, _ = self.project_in(inputs_embeds)
-            hidden_states = inputs_embeds + pos_embeds
+            hidden_states = mint.add(inputs_embeds, pos_embeds)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
