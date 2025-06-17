@@ -2,13 +2,13 @@
 
 import inspect
 from functools import cached_property
-from typing import Callable, Iterable, List, Optional, Set, Tuple, Union, Mapping
+from typing import Callable, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
 import mindspore as ms
 import mindspore.mint as mint
 import mindspore.nn as nn
 import numpy as np
-from transformers import Blip2QFormerConfig, BatchFeature
+from transformers import BatchFeature, Blip2QFormerConfig
 from vllm.attention import AttentionMetadata
 from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.models.blip2 import (
@@ -23,11 +23,14 @@ from vllm.model_executor.models.blip2 import (
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.multimodal import MULTIMODAL_REGISTRY, NestedTensors
 from vllm.sequence import IntermediateTensors
+from vllm_mindspore.model_executor.layers.activation import get_act_fn
 from vllm_mindspore.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
-from vllm_mindspore.model_executor.layers.activation import get_act_fn
 from vllm_mindspore.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm_mindspore.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+)
 from vllm_mindspore.model_executor.models.interfaces import SupportsMultiModal
 from vllm_mindspore.model_executor.models.model_base import Fake_Attention, MsModelBase
 from vllm_mindspore.model_executor.models.utils import (
@@ -36,7 +39,6 @@ from vllm_mindspore.model_executor.models.utils import (
 )
 from vllm_mindspore.model_executor.sampling_metadata import SamplingMetadata
 from vllm_mindspore.utils import STR_DTYPE_TO_MS_DTYPE
-from vllm_mindspore.model_executor.model_loader.weight_utils import default_weight_loader
 
 from .blip import BlipVisionModel
 from .opt import OPTForCausalLM
@@ -423,8 +425,7 @@ class Blip2QFormerModel(nn.Cell):
         embedding_output = self.dropout(embedding_output)
 
         sequence_output = self.encoder(
-            embedding_output,
-            encoder_hidden_states=encoder_hidden_states
+            embedding_output, encoder_hidden_states=encoder_hidden_states
         )
 
         return sequence_output
@@ -451,7 +452,10 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         self.vision_model = BlipVisionModel(config.vision_config, quant_config)
 
         self.query_tokens = ms.Parameter(
-            mint.zeros((1, config.num_query_tokens, config.qformer_config.hidden_size), dtype=ms.bfloat16)
+            mint.zeros(
+                (1, config.num_query_tokens, config.qformer_config.hidden_size),
+                dtype=ms.bfloat16,
+            )
         )
 
         self.qformer = Blip2QFormerModel(
@@ -470,17 +474,28 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "language_model"),
         )
-        self.language_model.model.decoder.embed_tokens.set_inputs(ms.Tensor(shape=[None], dtype=ms.int64))
+        self.language_model.model.decoder.embed_tokens.set_inputs(
+            ms.Tensor(shape=[None], dtype=ms.int64)
+        )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
 
         self.set_modules(
-            {"vision_model": self.vision_model, "qformer": self.qformer, "query_tokens": self.query_tokens, "language_projection": self.language_projection, "language_model": self.language_model}
+            {
+                "vision_model": self.vision_model,
+                "qformer": self.qformer,
+                "query_tokens": self.query_tokens,
+                "language_projection": self.language_projection,
+                "language_model": self.language_model,
+            }
         )
 
-        self.kv_caches = [Fake_Attention(dtype=ms.float16) for i in range(config.get_text_config().num_hidden_layers)]
+        self.kv_caches = [
+            Fake_Attention(dtype=ms.float16)
+            for i in range(config.get_text_config().num_hidden_layers)
+        ]
         compilation_config = vllm_config.compilation_config
 
         if prefix in compilation_config.static_forward_context:
@@ -596,13 +611,15 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         input_ids: ms.Tensor,
         multimodal_embeddings: Optional[NestedTensors] = None,
     ) -> ms.Tensor:
-        inputs_embeds = self.language_model.get_input_embeddings(input_ids).to(ms.bfloat16)
+        inputs_embeds = self.language_model.get_input_embeddings(input_ids).to(
+            ms.bfloat16
+        )
         if multimodal_embeddings is not None:
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids, inputs_embeds, multimodal_embeddings, _IMAGE_TOKEN_ID
             )
         return inputs_embeds
-    
+
     def set_model_inputs(
         self,
         input_ids: Optional[ms.Tensor] = None,
@@ -708,7 +725,9 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         # condition is for v0 compatibility.
         elif inputs_embeds is None:
             vision_embeddings = self.get_multimodal_embeddings(**kwargs)
-            inputs_embeds = self.get_input_embeddings(input_ids, vision_embeddings).to(ms.float16)
+            inputs_embeds = self.get_input_embeddings(input_ids, vision_embeddings).to(
+                ms.float16
+            )
             input_ids = None
 
         if attn_metadata.num_prefill_tokens > 0:
@@ -761,9 +780,13 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         params_dict = self.get_params_dict()
         for name, weight in weights:
             if "vision_model." in name:
-                self.vision_model.load_weights([(name, weight.to(ms.bfloat16))], params_dict)
+                self.vision_model.load_weights(
+                    [(name, weight.to(ms.bfloat16))], params_dict
+                )
             elif "language_model." in name:
-                self.language_model.load_weights([(name.replace("language_model.", ""), weight.to(ms.float16))])
+                self.language_model.load_weights(
+                    [(name.replace("language_model.", ""), weight.to(ms.float16))]
+                )
             else:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

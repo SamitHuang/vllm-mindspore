@@ -6,9 +6,9 @@ from typing import Dict, Iterable, Optional, Set, Tuple, Union
 
 import mindspore as ms
 import mindspore.mint as mint
+import mindspore.mint.nn.functional as F
 import mindspore.nn as nn
 import mindspore.ops as ops
-import mindspore.mint.nn.functional as F
 from transformers import Blip2VisionConfig, BlipVisionConfig
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm_mindspore.model_executor.layers.activation import get_act_fn
@@ -47,7 +47,9 @@ class BlipVisionEmbeddings(nn.Cell):
         self.image_size = config.image_size
         self.patch_size = config.patch_size
 
-        self.class_embedding = ms.Parameter(mint.randn(1, 1, self.embed_dim, dtype=ms.bfloat16))
+        self.class_embedding = ms.Parameter(
+            mint.randn(1, 1, self.embed_dim, dtype=ms.bfloat16)
+        )
 
         self.patch_embedding = mint.nn.Conv2d(
             in_channels=3,
@@ -150,7 +152,7 @@ class BlipAttention(nn.Cell):
         )
 
         if self.padding_num > 0:
-            out = out[..., :self.head_dim]
+            out = out[..., : self.head_dim]
 
         out = out.view(b, q_len, -1)
         return out
