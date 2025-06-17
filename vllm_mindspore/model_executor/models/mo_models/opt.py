@@ -117,7 +117,6 @@ class OPTAttention(nn.Cell):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
-            flatten=False,
         )
         self.hard_mask = ms.Tensor([0], dtype=ms.float16).reshape(1, 1)
 
@@ -136,9 +135,6 @@ class OPTAttention(nn.Cell):
     ) -> ms.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
-        attn_mask = mint.triu(
-            mint.ones(size=(1, 1, q.shape[-2], k.shape[-2]), dtype=ms.bool_), 1
-        )
         attn_output = self.attn(
             q,
             k,
@@ -151,7 +147,7 @@ class OPTAttention(nn.Cell):
             batch_valid_length,
             q_seq_lens,
             block_tables,
-            attn_mask,
+            None,
             self.hard_mask,
         )
         output, _ = self.out_proj(attn_output)
