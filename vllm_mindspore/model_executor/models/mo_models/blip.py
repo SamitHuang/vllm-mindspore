@@ -8,6 +8,7 @@ import mindspore as ms
 import mindspore.mint as mint
 import mindspore.nn as nn
 import mindspore.ops as ops
+import mindspore.mint.nn.functional as F
 from transformers import Blip2VisionConfig, BlipVisionConfig
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm_mindspore.model_executor.layers.activation import get_act_fn
@@ -124,17 +125,34 @@ class BlipAttention(nn.Cell):
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_heads_per_partition = divide(self.num_heads, self.tp_size)
+        self.padding_num = 16 - self.head_dim % 16
 
     def attn(self, query: ms.Tensor, key: ms.Tensor, value: ms.Tensor):
+        b, q_len, _ = query.shape
+        _, k_len, _ = key.shape
+
+        query = query.view(b, q_len, self.num_heads, self.head_dim)
+        key = key.view(b, k_len, self.num_heads, self.head_dim)
+        value = value.view(b, k_len, self.num_heads, self.head_dim)
+
+        if self.padding_num > 0:
+            query = F.pad(query, (0, self.padding_num))
+            key = F.pad(key, (0, self.padding_num))
+            value = F.pad(value, (0, self.padding_num))
+
         out = ops.flash_attention_score(
             query,
             key,
             value,
             self.num_heads // self.tp_size,
-            scalar_value=1 / math.sqrt(query.shape[-1]),
-            input_layout="BSH",
+            scalar_value=1 / math.sqrt(self.head_dim),
+            input_layout="BSND",
         )
 
+        if self.padding_num > 0:
+            out = out[..., :self.head_dim]
+
+        out = out.view(b, q_len, -1)
         return out
 
     def construct(
