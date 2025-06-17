@@ -133,9 +133,9 @@ class BlipAttention(nn.Cell):
         b, q_len, _ = query.shape
         _, k_len, _ = key.shape
 
-        query = query.view(b, q_len, self.num_heads, self.head_dim)
-        key = key.view(b, k_len, self.num_heads, self.head_dim)
-        value = value.view(b, k_len, self.num_heads, self.head_dim)
+        query = query.view(b, q_len, self.num_heads // self.tp_size, self.head_dim)
+        key = key.view(b, k_len, self.num_heads // self.tp_size, self.head_dim)
+        value = value.view(b, k_len, self.num_heads // self.tp_size, self.head_dim)
 
         if self.padding_num > 0:
             query = F.pad(query, (0, self.padding_num))
