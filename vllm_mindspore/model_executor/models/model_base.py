@@ -144,6 +144,9 @@ class MsModelBase(nn.Cell):
 
         res_modules = set()
         for name, module in self.modules_dict.items():
+            if isinstance(module, Parameter):
+                continue
+
             for module_name, sub_module in module.cells_and_names():
                 if name != "self":
                     module_name = name + "." + module_name
@@ -156,6 +159,8 @@ class MsModelBase(nn.Cell):
         self._check_modules_valid()
 
         for _, module in self.modules_dict.items():
+            if isinstance(module, Parameter):
+                continue
             module.set_train(False)
 
         return self

@@ -33,6 +33,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from vllm.model_executor.layers.linear import adjust_scalar_to_fused_array, adjust_marlin_shard, adjust_bitsandbytes_4bit_shard
 from vllm_mindspore.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -59,6 +60,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "HQQMarlinMethod",
     "QuarkLinearMethod"
 ]
+
 
 
 class LinearMethodBase(QuantizeMethodBase):
@@ -503,14 +505,76 @@ class QKVParallelLinear(ColumnParallelLinear):
             prefix=prefix,
         )
 
-    def weight_loader(self, param, loaded_weight, loaded_shard_id):
+    def weight_loader(self, param, loaded_weight, loaded_shard_id = None):
+        param_data = param.data
         output_dim = getattr(param, "output_dim", None)
+
+        # Special case for per-tensor scales in fused case.
+        needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
+
+        if loaded_shard_id is None:
+            # Loaded weight is already fused on disk (qkv).
+            # (e.g., Phi-3's qkv_proj).
+            if output_dim is None:
+                if needs_scalar_to_array:
+                    param_data, loaded_weight = adjust_scalar_to_fused_array(
+                        param_data, loaded_weight, 0)
+
+                assert param_data.shape == loaded_weight.shape
+                param.set_data(loaded_weight)
+                return
+            shard_offsets = [
+                # (shard_id, shard_offset, shard_size)
+                ("q", 0, self.total_num_heads * self.head_size),
+                ("k", self.total_num_heads * self.head_size,
+                 self.total_num_kv_heads * self.head_size),
+                ("v", (self.total_num_heads + self.total_num_kv_heads) *
+                 self.head_size, self.total_num_kv_heads * self.head_size),
+            ]
+            use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit",
+                                            False)
+            packed_dim = getattr(param, "packed_dim", None)
+            for shard_id, shard_offset, shard_size in shard_offsets:
+                # Special case for Quantized Weights.
+                # If quantized, we need to adjust the offset and size to account
+                # for the packing.
+                if packed_dim == output_dim:
+                    shard_size = shard_size // param.pack_factor
+                    shard_offset = shard_offset // param.pack_factor
+
+                    # Special case for Marlin.
+                    shard_size, shard_offset = adjust_marlin_shard(
+                        param, shard_size, shard_offset)
+
+                if use_bitsandbytes_4bit:
+                    orig_qkv_offsets = {
+                        "q": (0, self.total_num_heads * self.head_size),
+                        "k": (self.total_num_heads * self.head_size,
+                              self.total_num_kv_heads * self.head_size),
+                        "v":
+                        ((self.total_num_heads + self.total_num_kv_heads) *
+                         self.head_size,
+                         self.total_num_kv_heads * self.head_size),
+                        "total":
+                        ((self.total_num_heads + 2 * self.total_num_kv_heads) *
+                         self.head_size, 0)
+                    }
+
+                    shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
+                        param, orig_qkv_offsets, shard_id)
+
+                loaded_weight_shard = loaded_weight.narrow(
+                    output_dim, shard_offset, shard_size)
+                self.weight_loader(param, loaded_weight_shard, shard_id)
+            return
+
+
         tp_rank = get_tensor_model_parallel_rank()
         assert loaded_shard_id in ["q", "k", "v"]
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
         # If output dim is defined, use the default loading process.
         # if output_dim is not None:
-        param_data = param.data
+
         if True:
             if loaded_shard_id == "q":
                 shard_offset = 0
