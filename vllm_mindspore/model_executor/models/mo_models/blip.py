@@ -46,7 +46,7 @@ class BlipVisionEmbeddings(nn.Cell):
         self.image_size = config.image_size
         self.patch_size = config.patch_size
 
-        self.class_embedding = ms.Parameter(mint.randn(1, 1, self.embed_dim))
+        self.class_embedding = ms.Parameter(mint.randn(1, 1, self.embed_dim, dtype=ms.bfloat16))
 
         self.patch_embedding = mint.nn.Conv2d(
             in_channels=3,
@@ -62,7 +62,7 @@ class BlipVisionEmbeddings(nn.Cell):
         self.num_positions = self.num_patches + 1
 
         self.position_embedding = ms.Parameter(
-            mint.randn(1, self.num_positions, self.embed_dim)
+            mint.randn(1, self.num_positions, self.embed_dim, dtype=ms.bfloat16)
         )
 
     def construct(self, pixel_values: ms.Tensor) -> ms.Tensor:
@@ -126,21 +126,15 @@ class BlipAttention(nn.Cell):
         self.num_heads_per_partition = divide(self.num_heads, self.tp_size)
 
     def attn(self, query: ms.Tensor, key: ms.Tensor, value: ms.Tensor):
-        bsz, q_len, _ = query.shape
-        kv_len = key.shape[1]
-
-        query = query.view(bsz, q_len, self.num_heads, self.head_dim)
-        key = key.view(bsz, kv_len, self.num_heads, self.head_dim)
-        value = value.view(bsz, kv_len, self.num_heads, self.head_dim)
-
         out = ops.flash_attention_score(
             query,
             key,
             value,
             self.num_heads // self.tp_size,
             scalar_value=1 / math.sqrt(query.shape[-1]),
-            input_layout="BSND",
+            input_layout="BSH",
         )
+
         return out
 
     def construct(

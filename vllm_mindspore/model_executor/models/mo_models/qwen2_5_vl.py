@@ -1175,7 +1175,7 @@ class Qwen2_5_VLForConditionalGeneration(MsModelBase, SupportsMultiModal):
             inputs_embeds = inputs_embeds.expand_dims(0)
             self.set_model_inputs(input_ids, positions, inputs_embeds)
             self.decode_first_time = True
-        if attn_metadata.num_decode_tokens > 0:
+        elif attn_metadata.num_decode_tokens > 0:
             input_ids = input_ids.expand_dims(1)
             if self.decode_first_time:
                 self.set_model_inputs(input_ids, positions, inputs_embeds)

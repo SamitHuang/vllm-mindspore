@@ -249,7 +249,8 @@ class MsModelBase(nn.Cell):
         key_cache = []
         value_cache = []
         forward_context = get_forward_context()
-        for i in range(self.config.num_hidden_layers):
+        num_hidden_layers = getattr(self.config, "num_hidden_layers", self.config.get_text_config().num_hidden_layers)
+        for i in range(num_hidden_layers):
             k_cache = self.kv_caches[i].kv_cache[forward_context.virtual_engine][0]
             v_cache = self.kv_caches[i].kv_cache[forward_context.virtual_engine][1]
             key_cache.append(k_cache)

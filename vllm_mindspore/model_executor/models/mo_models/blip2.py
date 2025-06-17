@@ -2,13 +2,13 @@
 
 import inspect
 from functools import cached_property
-from typing import Callable, Iterable, List, Optional, Set, Tuple, Union
+from typing import Callable, Iterable, List, Optional, Set, Tuple, Union, Mapping
 
 import mindspore as ms
 import mindspore.mint as mint
 import mindspore.nn as nn
 import numpy as np
-from transformers import Blip2QFormerConfig
+from transformers import Blip2QFormerConfig, BatchFeature
 from vllm.attention import AttentionMetadata
 from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.models.blip2 import (
@@ -87,6 +87,27 @@ def apply_chunking_to_forward(
         return mint.cat(output_chunks, dim=chunk_dim)
 
     return forward_fn(*input_tensors)
+
+
+class Blip2MultiModalProcessor_(Blip2MultiModalProcessor):
+
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        if not mm_data:
+            # HF processor always adds placeholders even when there's no image
+            tokenizer = self.info.get_tokenizer()
+            prompt_ids = tokenizer.encode(prompt)
+            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="np")
+
+        return super()._call_hf_processor(
+            prompt=prompt,
+            mm_data=mm_data,
+            mm_kwargs=mm_kwargs,
+        )
 
 
 class Blip2QFormerMultiHeadAttention(nn.Cell):
@@ -398,22 +419,19 @@ class Blip2QFormerModel(nn.Cell):
         query_embeds: ms.Tensor,
         encoder_hidden_states: ms.Tensor,
     ) -> ms.Tensor:
-        query_length = query_embeds.shape[1]
-
         embedding_output = self.layernorm(query_embeds)
         embedding_output = self.dropout(embedding_output)
 
         sequence_output = self.encoder(
             embedding_output,
-            encoder_hidden_states=encoder_hidden_states,
-            query_length=query_length,
+            encoder_hidden_states=encoder_hidden_states
         )
 
         return sequence_output
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    Blip2MultiModalProcessor,
+    Blip2MultiModalProcessor_,
     info=Blip2ProcessingInfo,
     dummy_inputs=Blip2DummyInputsBuilder,
 )
@@ -433,7 +451,7 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         self.vision_model = BlipVisionModel(config.vision_config, quant_config)
 
         self.query_tokens = ms.Parameter(
-            mint.zeros((1, config.num_query_tokens, config.qformer_config.hidden_size))
+            mint.zeros((1, config.num_query_tokens, config.qformer_config.hidden_size), dtype=ms.bfloat16)
         )
 
         self.qformer = Blip2QFormerModel(
@@ -462,7 +480,7 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
             {"vision_model": self.vision_model, "qformer": self.qformer, "query_tokens": self.query_tokens, "language_projection": self.language_projection, "language_model": self.language_model}
         )
 
-        self.kv_caches = [Fake_Attention() for i in range(config.get_text_config().num_hidden_layers)]
+        self.kv_caches = [Fake_Attention(dtype=ms.float16) for i in range(config.get_text_config().num_hidden_layers)]
         compilation_config = vllm_config.compilation_config
 
         if prefix in compilation_config.static_forward_context:
@@ -578,7 +596,7 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         input_ids: ms.Tensor,
         multimodal_embeddings: Optional[NestedTensors] = None,
     ) -> ms.Tensor:
-        inputs_embeds = self.language_model.get_input_embeddings(input_ids)
+        inputs_embeds = self.language_model.get_input_embeddings(input_ids).to(ms.bfloat16)
         if multimodal_embeddings is not None:
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids, inputs_embeds, multimodal_embeddings, _IMAGE_TOKEN_ID
@@ -690,15 +708,15 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         # condition is for v0 compatibility.
         elif inputs_embeds is None:
             vision_embeddings = self.get_multimodal_embeddings(**kwargs)
-            inputs_embeds = self.get_input_embeddings(input_ids, vision_embeddings)
+            inputs_embeds = self.get_input_embeddings(input_ids, vision_embeddings).to(ms.float16)
             input_ids = None
 
         if attn_metadata.num_prefill_tokens > 0:
             inputs_embeds = inputs_embeds.expand_dims(0)
             self.set_model_inputs(input_ids, positions, inputs_embeds)
             self.decode_first_time = True
-        if attn_metadata.num_decode_tokens > 0:
-            input_ids = input_ids.expand_dims(1)
+        elif attn_metadata.num_decode_tokens > 0:
+            inputs_embeds = inputs_embeds.expand_dims(1)
             if self.decode_first_time:
                 self.set_model_inputs(input_ids, positions, inputs_embeds)
                 self.decode_first_time = False
@@ -743,10 +761,10 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         params_dict = self.get_params_dict()
         for name, weight in weights:
             if "vision_model." in name:
-                self.vision_model.load_weights([(name, weight)], params_dict)
+                self.vision_model.load_weights([(name, weight.to(ms.bfloat16))], params_dict)
             elif "language_model." in name:
                 self.language_model.load_weights([(name.replace("language_model.", ""), weight.to(ms.float16))])
             else:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight)
+                weight_loader(param, weight.to(ms.bfloat16))
