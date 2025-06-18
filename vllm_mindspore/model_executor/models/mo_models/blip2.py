@@ -182,7 +182,7 @@ class Blip2QFormerMultiHeadAttention(nn.Cell):
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
 
-        attention_scores = mint.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores = mint.matmul(query_layer, mint.transpose(key_layer, -1, -2))
         attention_probs = mint.softmax(attention_scores * self.scaling, dim=-1)
 
         # This is actually dropping out entire tokens to attend to, which might
@@ -215,7 +215,7 @@ class Blip2QFormerSelfOutput(nn.Cell):
     def construct(self, hidden_states: ms.Tensor, input_tensor: ms.Tensor) -> ms.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        hidden_states = self.LayerNorm(mint.add(hidden_states, input_tensor))
         return hidden_states
 
 
@@ -290,7 +290,7 @@ class Blip2QFormerOutput(nn.Cell):
     ) -> ms.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        hidden_states = self.LayerNorm(mint.add(hidden_states, input_tensor))
         return hidden_states
 
 
@@ -416,6 +416,7 @@ class Blip2QFormerModel(nn.Cell):
             config, quant_config=quant_config, cache_config=cache_config
         )
 
+    @ms.jit(jit_level="O0", infer_boost="on")
     def construct(
         self,
         query_embeds: ms.Tensor,
@@ -463,6 +464,10 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
 
         self.qformer = Blip2QFormerModel(
             config.qformer_config, cache_config=cache_config, quant_config=quant_config
+        )
+        self.qformer.set_inputs(
+            ms.Tensor(shape=[None, None, None], dtype=ms.bfloat16),
+            ms.Tensor(shape=[None, None, None], dtype=ms.bfloat16),
         )
 
         self.language_projection = mint.nn.Linear(
@@ -594,7 +599,9 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
         assert self.vision_model is not None
         image_features = self._process_image_pixels(image_input)
 
-        query_tokens = self.query_tokens.expand((image_features.shape[0], -1, -1))
+        query_tokens = mint.broadcast_to(
+            self.query_tokens, (image_features.shape[0], -1, -1)
+        )
         query_output = self.qformer(
             query_embeds=query_tokens,
             encoder_hidden_states=image_features,
