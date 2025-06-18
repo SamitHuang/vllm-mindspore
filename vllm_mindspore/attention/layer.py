@@ -128,21 +128,9 @@ class Attention(nn.Cell):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
-        self.hidden_size_per_partition = num_heads*head_size
-        self.kv_hidden_size_per_partition = num_kv_heads*head_size
-        self.flatten = True
-
-        input_layout = "TH" if self.flatten else "BSH"  # pynative 下不支持拉平操作。
-        scale = float(scale)
-        pre_tokens = 2147483647
-        next_tokens = 2147483647
+        self.scale = float(scale)
 
         self.reshape_and_cache = ReshapeAndCache()
-        self.flash_attention = FlashAttentionScore(head_num=num_heads,
-                                                   scale_value=scale,
-                                                   pre_tokens=pre_tokens,
-                                                   next_tokens=next_tokens,
-                                                   input_layout=input_layout)
         self.paged_attention = PagedAttention(head_num=num_heads,
                                               scale_value=scale,
                                               kv_head_num=num_kv_heads)
@@ -179,7 +167,7 @@ class Attention(nn.Cell):
         cache_out = self.reshape_and_cache(key, value, key_cache, value_cache, slot_mapping)
         query = ops.depend(query, cache_out)
         if num_prefill_tokens > 0:
-            output = self._run_prefill_forward(query, key, value, attn_mask, batch_valid_length, batch_valid_length)
+            output = self._run_prefill_forward(query, key, value, batch_valid_length, batch_valid_length)
         if num_decode_tokens > 0:
             output = self._run_decode_forward(query, key_cache, value_cache, block_tables,batch_valid_length,
                                               decode_mask, q_seq_lens)
@@ -190,7 +178,6 @@ class Attention(nn.Cell):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attn_mask: Tensor,
         actual_seq_qlen: Tuple[int],
         actual_seq_kvlen: Tuple[int],
     ) -> Tensor:
@@ -202,24 +189,28 @@ class Attention(nn.Cell):
             value: shape = [1, num_tokens, hidden_size]
             actual_seq_qlen: shape = [batch_size, ]
             actual_seq_kvlen: shape = [batch_size, ]
-        NOTE: Currently `PyNative` mode does not support operations in "TH" form, so it will be converted to "BSH" form.
         """
-        query = query.view(-1, self.hidden_size_per_partition)
-        key = key.view(-1, self.kv_hidden_size_per_partition)
-        value = value.view(-1, self.kv_hidden_size_per_partition)
-        _, _, _, output = self.flash_attention(
+        query = query.view(-1, self.num_heads, self.head_size)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size)
+
+        actual_seq_qlen = mint.cumsum(actual_seq_qlen, 0)
+        actual_seq_kvlen = mint.cumsum(actual_seq_kvlen, 0)
+
+        attn_mask = mint.triu(mint.ones(size=(query.shape[0], key.shape[0]), dtype=mstype.bool_), 1)
+
+        output = ops.flash_attention_score(
             query,
             key,
             value,
-            None,
-            None,
-            None,
-            attn_mask,
-            None,
-            actual_seq_qlen,
-            actual_seq_kvlen
+            head_num=self.num_heads,
+            attn_mask=attn_mask,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_kvlen=actual_seq_kvlen,
+            scalar_value=self.scale,
+            input_layout="TND",
         )
-        output = output.view(1, -1, self.hidden_size_per_partition)
+        output = output.view(1, output.shape[0], -1)
         return output
 
     def _run_decode_forward(

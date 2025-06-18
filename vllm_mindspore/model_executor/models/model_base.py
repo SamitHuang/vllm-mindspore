@@ -30,13 +30,13 @@ from vllm.forward_context import get_forward_context
 
 import torch
 
-from mindspore import Tensor, nn, mutable
+from mindspore import Tensor, nn, mutable, Parameter
 from mindspore import dtype as mstype
 
 from vllm_mindspore.utils import STR_DTYPE_TO_MS_DTYPE
 
 class Fake_Attention:
-    def __init__(self):
+    def __init__(self, dtype=torch.bfloat16):
         vllm_config = get_current_vllm_config()
         block_size = vllm_config.cache_config.block_size
         num_kv_heads = vllm_config.model_config.get_num_kv_heads(
@@ -47,8 +47,8 @@ class Fake_Attention:
         self.kv_shape = [num_block, block_size, num_kv_heads, head_size]
         self.kv_cache = [
             (
-                torch.zeros(self.kv_shape, dtype=torch.bfloat16, device="Ascend"),
-                torch.zeros(self.kv_shape, dtype=torch.bfloat16, device="Ascend"),
+                torch.zeros(self.kv_shape, dtype=dtype, device="Ascend"),
+                torch.zeros(self.kv_shape, dtype=dtype, device="Ascend"),
             )
             for _ in range(vllm_config.parallel_config.pipeline_parallel_size)
         ]
@@ -64,9 +64,9 @@ class Fake_MLA(Fake_Attention):
             for _ in range(vllm_config.parallel_config.pipeline_parallel_size)
         ]
 
-class MsModelBase():
+class MsModelBase(nn.Cell):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super(MsModelBase, self).__init__()
+        super(MsModelBase, self).__init__(auto_prefix=False)
         config = vllm_config.model_config.hf_config
         lora_config = vllm_config.lora_config
 
@@ -111,6 +111,9 @@ class MsModelBase():
         self._check_modules_valid()
 
         for cell_name, module in self.modules_dict.items():
+            if isinstance(module, Parameter):
+                yield cell_name, module
+                continue
             for par_name, par in module.parameters_and_names():
                 if cell_name != "self":
                     par_name = cell_name + "." + par_name
@@ -122,6 +125,10 @@ class MsModelBase():
 
         params_dict = dict()
         for name, module in self.modules_dict.items():
+            if isinstance(module, Parameter):
+                params_dict[name] = module
+                continue
+
             module_params = module.parameters_dict()
             if name != "self":
                 new_module_params = dict()
@@ -137,6 +144,9 @@ class MsModelBase():
 
         res_modules = set()
         for name, module in self.modules_dict.items():
+            if isinstance(module, Parameter):
+                continue
+
             for module_name, sub_module in module.cells_and_names():
                 if name != "self":
                     module_name = name + "." + module_name
@@ -149,6 +159,8 @@ class MsModelBase():
         self._check_modules_valid()
 
         for _, module in self.modules_dict.items():
+            if isinstance(module, Parameter):
+                continue
             module.set_train(False)
 
         return self
@@ -237,7 +249,8 @@ class MsModelBase():
         key_cache = []
         value_cache = []
         forward_context = get_forward_context()
-        for i in range(self.config.num_hidden_layers):
+        num_hidden_layers = getattr(self.config, "num_hidden_layers", self.config.get_text_config().num_hidden_layers)
+        for i in range(num_hidden_layers):
             k_cache = self.kv_caches[i].kv_cache[forward_context.virtual_engine][0]
             v_cache = self.kv_caches[i].kv_cache[forward_context.virtual_engine][1]
             key_cache.append(k_cache)

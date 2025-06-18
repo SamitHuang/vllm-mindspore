@@ -42,8 +42,10 @@ _MINDFORMERS_MODELS = {
 }
 
 _MINDONE_MODELS = {
+    "Blip2ForConditionalGeneration": ("blip2", "Blip2ForConditionalGeneration"),
+    "OPTForCausalLM": ("opt", "OPTForCausalLM"),
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
-    "Qwen2_5_VLForConditionalGeneration": ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration")
+    "Qwen2_5_VLForConditionalGeneration": ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),
 }
 
 def get_model_info():
