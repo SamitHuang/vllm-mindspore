@@ -450,6 +450,9 @@ class Blip2ForConditionalGeneration(MsModelBase, SupportsMultiModal, SupportsPP)
 
         # TODO: Optionally initializes this for supporting embeddings.
         self.vision_model = BlipVisionModel(config.vision_config, quant_config)
+        self.vision_model.set_inputs(
+            ms.Tensor(shape=[None, None, None, None], dtype=ms.float32)
+        )
 
         self.query_tokens = ms.Parameter(
             mint.zeros(

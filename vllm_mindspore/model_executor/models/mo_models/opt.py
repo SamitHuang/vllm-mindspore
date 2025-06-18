@@ -120,7 +120,6 @@ class OPTAttention(nn.Cell):
         )
         self.hard_mask = ms.Tensor([0], dtype=ms.float16).reshape(1, 1)
 
-    @ms.jit
     def construct(
         self,
         hidden_states: ms.Tensor,
@@ -204,7 +203,6 @@ class OPTDecoderLayer(nn.Cell):
             dtype=ms.float16,
         )
 
-    @ms.jit
     def construct(
         self,
         hidden_states: ms.Tensor,
@@ -327,7 +325,6 @@ class OPTDecoder(nn.Cell):
     def get_input_embeddings(self, input_ids: ms.Tensor) -> ms.Tensor:
         return self.embed_tokens(input_ids)
 
-    @ms.jit
     def construct(
         self,
         input_ids: ms.Tensor,

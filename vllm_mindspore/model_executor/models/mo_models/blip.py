@@ -74,13 +74,13 @@ class BlipVisionEmbeddings(nn.Cell):
         patch_embeds = self.patch_embedding(
             pixel_values.to(dtype=target_dtype)
         )  # shape = [*, width, grid, grid]
-        patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
+        patch_embeds = mint.transpose(patch_embeds.flatten(2), 1, 2)
 
-        class_embeds = self.class_embedding.expand((batch_size, 1, -1))
+        class_embeds = mint.broadcast_to(self.class_embedding, (batch_size, 1, -1))
         embeddings = mint.cat([class_embeds, patch_embeds], dim=1)
 
         position_embeds = self.position_embedding.to(target_dtype)
-        embeddings = embeddings + position_embeds[:, : embeddings.shape[1], :]
+        embeddings = mint.add(embeddings, position_embeds[:, : embeddings.shape[1], :])
 
         return embeddings
 
@@ -142,14 +142,21 @@ class BlipAttention(nn.Cell):
             key = F.pad(key, (0, self.padding_num))
             value = F.pad(value, (0, self.padding_num))
 
+        # under jit, it does not support BSND, converted back to BSH
+        query = query.view(b, q_len, -1)
+        key = key.view(b, k_len, -1)
+        value = value.view(b, k_len, -1)
+
         out = ops.flash_attention_score(
             query,
             key,
             value,
             self.num_heads // self.tp_size,
             scalar_value=1 / math.sqrt(self.head_dim),
-            input_layout="BSND",
+            input_layout="BSH",
         )
+
+        out = out.view(b, q_len, self.num_heads // self.tp_size, -1)
 
         if self.padding_num > 0:
             out = out[..., : self.head_dim]
@@ -238,12 +245,12 @@ class BlipEncoderLayer(nn.Cell):
 
         hidden_states = self.layer_norm1(hidden_states)
         hidden_states, _ = self.self_attn(hidden_states=hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = mint.add(residual, hidden_states)
 
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = mint.add(residual, hidden_states)
 
         return hidden_states
 
@@ -334,6 +341,7 @@ class BlipVisionModel(nn.Cell):
         else:
             self.post_layernorm = None
 
+    @ms.jit(jit_level="O0", infer_boost="on")
     def construct(self, pixel_values: ms.Tensor) -> ms.Tensor:
         hidden_states = self.embeddings(pixel_values)
         hidden_states = self.encoder(inputs_embeds=hidden_states)
