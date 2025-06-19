@@ -17,7 +17,6 @@
 # ============================================================================
 
 from mindspore import Tensor, mint, nn, ops
-from vllm.utils import LazyDict
 
 
 class SiluAndMul(nn.Cell):
@@ -56,23 +55,3 @@ class SwiGLU(nn.Cell):
         gate = self.silu(gate)
         hidden = self.mul(hidden, gate)
         return hidden
-
-
-_ACTIVATION_REGISTRY = LazyDict({
-    "gelu":
-    lambda: mint.nn.GELU(),
-    "relu":
-    lambda: mint.nn.ReLU(),
-    "silu":
-    lambda: mint.nn.SiLU(),
-})
-
-
-def get_act_fn(act_fn_name: str) -> nn.Cell:
-    """Get an activation function by name."""
-    act_fn_name = act_fn_name.lower()
-    if act_fn_name not in _ACTIVATION_REGISTRY:
-        raise ValueError(
-            f"Activation function {act_fn_name!r} is not supported.")
-
-    return _ACTIVATION_REGISTRY[act_fn_name]

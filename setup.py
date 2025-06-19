@@ -40,6 +40,7 @@ def load_module_from_path(module_name, path):
 
 
 ROOT_DIR = os.path.dirname(__file__)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -101,12 +102,11 @@ version = (Path("vllm_mindspore") / "version.txt").read_text()
 def _get_ascend_home_path():
     return os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
 
-def _get_ascend_env_path(check_exists=True):
-    env_script_path = os.path.join(_get_ascend_home_path(), "bin", "setenv.bash")
-    if check_exists and not os.path.exists(env_script_path):
-        warnings.warn(f"The file '{env_script_path}' is not found, "
-                            "please make sure env variable 'ASCEND_HOME_PATH' is set correctly.")
-        return None
+def _get_ascend_env_path():
+    env_script_path = os.path.realpath(os.path.join(_get_ascend_home_path(), "..", "set_env.sh"))
+    if not os.path.exists(env_script_path):
+        raise ValueError(f"The file '{env_script_path}' is not found, "
+                            "please make sure environment variable 'ASCEND_HOME_PATH' is set correctly.")
     return env_script_path
 
 class CustomBuildExt(build_ext):
@@ -122,13 +122,13 @@ class CustomBuildExt(build_ext):
         # "vllm_mindspore.npu_ops" --> "npu_ops"
         ext_name = ext.name.split('.')[-1]
         so_name = ext_name + ".so"
-        print(f"Building {so_name} ...")
+        logger.info(f"Building {so_name} ...")
         OPS_DIR = os.path.join(ROOT_DIR, "vllm_mindspore", "ops")
         BUILD_OPS_DIR = os.path.join(ROOT_DIR, "build", "ops")
         os.makedirs(BUILD_OPS_DIR, exist_ok=True)
 
         ascend_home_path = _get_ascend_home_path()
-        env_script_path = _get_ascend_env_path(False)
+        env_script_path = _get_ascend_env_path()
         build_extension_dir = os.path.join(BUILD_OPS_DIR, "kernel_meta", ext_name)
         # Combine all cmake commands into one string
         cmake_cmd = (
@@ -144,12 +144,12 @@ class CustomBuildExt(build_ext):
 
         try:
             # Run the combined cmake command
-            print(f"Running combined CMake commands:\n{cmake_cmd}")
+            logger.info(f"Running combined CMake commands:\n{cmake_cmd}")
             result = subprocess.run(cmake_cmd, cwd=self.ROOT_DIR, text=True, shell=True, capture_output=True)
             if result.returncode != 0:
-                print("CMake commands failed:")
-                print(result.stdout)  # Print standard output
-                print(result.stderr)  # Print error output
+                logger.info("CMake commands failed:")
+                logger.info(result.stdout)  # Print standard output
+                logger.info(result.stderr)  # Print error output
                 raise RuntimeError(f"Combined CMake commands failed with exit code {result.returncode}")
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to build {so_name}: {e}")
@@ -161,7 +161,7 @@ class CustomBuildExt(build_ext):
         if os.path.exists(dst_so_path):
             os.remove(dst_so_path)
         shutil.copy(src_so_path, dst_so_path)
-        print(f"Copied {so_name} to {dst_so_path}")
+        logger.info(f"Copied {so_name} to {dst_so_path}")
 
 
 write_commit_id()
@@ -176,12 +176,9 @@ package_data = {
 
 def _get_ext_modules():
     ext_modules = []
-    # Currently, the CI environment does not support the compilation of custom operators.
-    # As a temporary solution, this is controlled via an environment variable.
-    # Once the CI environment adds support for custom operator compilation,
-    # this should be updated to enable compilation by default.
-    if os.getenv("vLLM_USE_NPU_ADV_STEP_FLASH_OP", "off") == "on" and _get_ascend_env_path() is not None:
-        ext_modules.append(Extension("vllm_mindspore.npu_ops", sources=[])) # sources are specified in CMakeLists.txt
+    if os.path.exists(_get_ascend_home_path()):
+        # sources are specified in CMakeLists.txt
+        ext_modules.append(Extension("vllm_mindspore.npu_ops", sources=[]))
     return ext_modules
 
 setup(
@@ -218,4 +215,9 @@ setup(
     ext_modules=_get_ext_modules(),
     include_package_data=True,
     package_data=package_data,
+    entry_points={
+        "console_scripts": [
+            "vllm-mindspore=vllm_mindspore.scripts:main",
+        ],
+    },
 )

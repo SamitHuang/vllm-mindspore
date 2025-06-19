@@ -37,11 +37,11 @@ from vllm.sequence import (VLLM_INVALID_TOKEN_ID,
                            PromptLogprobs, SampleLogprobs, SequenceOutput)
 from vllm.spec_decode.metrics import SpecDecodeWorkerMetrics
 from vllm_mindspore.model_executor.layers.utils import apply_penalties
-from vllm_mindspore.model_executor.sampling_metadata import (
+from vllm.model_executor.sampling_metadata import (
     SamplingMetadata,
-    SamplingTensors,
-    SequenceGroupToSample,
+    SamplingTensors
 )
+from vllm.model_executor.sampling_metadata import SequenceGroupToSample
 
 if envs.VLLM_USE_FLASHINFER_SAMPLER and find_spec("flashinfer"):
     raise RuntimeError("Donot support for mindspore now.")
@@ -51,6 +51,10 @@ else:
 
 
 def get_sampler() -> torch.nn.Module:
+    if envs.VLLM_USE_V1:
+        # Lazy import: the v1 package isn't distributed
+        from vllm.v1.sample.sampler import Sampler as V1Sampler
+        return V1Sampler()
     return Sampler()
 
 
@@ -443,7 +447,8 @@ def _apply_min_p(
     """
     probs = torch.softmax(logits, dim=-1)
     top_probs, _ = probs.max(dim=-1, keepdim=True)
-    scaled_min_p = min_p.unsqueeze_(dim=1) * top_probs
+    # For MindSpore: unsqueeze_ will cause error, use unsqueeze instead
+    scaled_min_p = min_p.unsqueeze(dim=1) * top_probs
     tokens_to_remove = probs < scaled_min_p
     logits = logits.masked_fill_(tokens_to_remove, -float("inf"))
 

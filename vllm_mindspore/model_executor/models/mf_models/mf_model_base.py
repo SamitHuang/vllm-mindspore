@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# encoding: utf-8
 # Copyright 2025 Huawei Technologies Co., Ltd
 # Copyright 2024 The vLLM team.
 #
@@ -17,141 +16,119 @@
 # ============================================================================
 
 import os
-from types import MethodType
-from typing import Iterable, List, Optional, Set, Tuple, Union
 from abc import abstractmethod
-import numpy as np
+from typing import Iterable, Optional, Set, Tuple, Union
 
-from vllm.attention import AttentionMetadata
+import mindspore as ms
+from mindformers.core.context import build_mf_context
+from mindformers.core.parallel_config import build_parallel_config
+from mindformers.tools.register.config import MindFormerConfig
+from mindformers.tools.utils import is_pynative
+from mindspore import Tensor, mint
+from mindspore.common.api import _pynative_executor
+from mindspore.communication import get_rank
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.parallel_state import get_dp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
-from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.logger import init_logger
 
-import torch
-import mindspore as ms
-from mindspore import Tensor, mutable
-from mindspore.common.api import _pynative_executor
-
-from mindformers.tools.register.config import MindFormerConfig
-from mindformers.core.context import build_context
-from mindformers.core.parallel_config import build_parallel_config
-
+from vllm_mindspore.model_executor.models.attention_mask import (
+    LowerTriangularMask)
 from vllm_mindspore.model_executor.models.model_base import MsModelBase
 
 logger = init_logger(__name__)
 
 
-def _pad_to_max(x, max_len):
-    return x + [-1] * (max_len - len(x))
-
-
-def _batch_seq(input_tokens, prefill):
-    if prefill:
-        return ms.ops.expand_dims(input_tokens, 0).to(ms.int32)
-
-    return ms.mint.reshape(input_tokens, (-1, 1)).to(ms.int32)
-
-
-
 class MfModelBase(MsModelBase):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super(MfModelBase, self).__init__(
-            vllm_config=vllm_config, prefix=prefix
-        )
 
-        self.mf_config = MindFormerConfig(os.getenv("MINDFORMERS_MODEL_CONFIG"))
-        build_context(self.mf_config, is_set_ms_ctx=False, is_init_ms=False)
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        self.set_flags = False
+
+        model_config_path = os.getenv("MINDFORMERS_MODEL_CONFIG")
+        if model_config_path is None:
+            raise RuntimeError(
+                'For "MindFormers" model backend, environments MINDFORMERS_MODEL_CONFIG should be set!'
+            )
+
+        self.mf_config = MindFormerConfig(model_config_path)
+        self.rank_id = get_rank()
+        self.dp_size = get_dp_group()
+
+        build_mf_context(self.mf_config)
         build_parallel_config(self.mf_config)
         self.mf_config.model.model_config.parallel_config = (
-            self.mf_config.parallel_config
-        )
+            self.mf_config.parallel_config)
         self.mf_config.model.model_config.parallel_config.model_parallel = (
-            get_tensor_model_parallel_world_size()
-        )
+            get_tensor_model_parallel_world_size())
         self.mf_config.model.model_config.parallel_config.pipeline_stage = 1
-
         self._generate_model_config()
+        self.casual_mask = LowerTriangularMask(
+            dtype=self.mf_model_config.compute_dtype,
+            max_model_len=self.model_config.max_model_len)
         self.network, self.lm_head = self._create_network()
 
-        self.network.construct = MethodType(ms.jit(self.network.__class__.construct,
-                                                   jit_level='O0', infer_boost='on'),
-                                            self.network)
-        self.lm_head.construct = MethodType(ms.jit(self.lm_head.__class__.construct,
-                                                   jit_level='O0', infer_boost='on'),
-                                            self.lm_head)
+        affinity_config = self.mf_config.get('context',
+                                             {}).get('affinity_cpu_list', {})
+        if isinstance(affinity_config, dict):
+            ms.runtime.set_cpu_affinity(True, affinity_config)
+
+        self._set_dynamic_inputs()
 
     @abstractmethod
     def _generate_model_config(self):
-        raise NotImplementedError("Function _generate_model_config should be Implemented!")
+        raise NotImplementedError(
+            "Function _generate_model_config should be Implemented!")
 
     @abstractmethod
     def _create_network(self):
-        raise NotImplementedError("Function _create_network should be Implemented!")
+        raise NotImplementedError(
+            "Function _create_network should be Implemented!")
 
+    def _set_dynamic_inputs(self):
+        self.network.set_dynamic_inputs()
+        dynamic_hidden_states = Tensor(
+            shape=[None, None], dtype=self.mf_model_config.compute_dtype)
+        self.lm_head.set_inputs(dynamic_hidden_states)
 
-    def prepare_inputs(self, input_ids, positions, attn_metadata):
-        key_cache, value_cache = self.get_kvcache()
-        seq_lens = attn_metadata.seq_lens
-        max_query_len = attn_metadata.max_query_len
-        # When Mutli-Step is enabled with Chunked-Prefill, prefills and
-        # decodes are scheduled together. In the first step, all the
-        # prefills turn into decodes and max_query_len will be 1.
-        if self.is_multi_step_chunked_prefill and max_query_len == 1:
-            query_lens = [1] * len(seq_lens)
-        else:
-            query_lens = attn_metadata.query_lens
-
-        seq_lens_np = np.array(seq_lens, dtype=np.int32)
-        query_lens_np = np.array(query_lens, dtype=np.int32)
-        kv_cache_lens = seq_lens_np - query_lens_np
-        if attn_metadata.num_decode_tokens == 0 and kv_cache_lens.max() == 0:
-            is_prefill = True
-        else:
-            is_prefill = False
-
-        q_seq_lens = ms.Tensor(query_lens_np, dtype=ms.int32)
-        position_ids = ms.Tensor(positions, dtype=ms.int32)
-        attention_mask = self.casual_mask.gen_attention_mask(is_prefill, position_ids, query_lens)
-
-        model_inputs = {}
-        model_inputs["input_ids"] = _batch_seq(input_ids, is_prefill)
-        model_inputs["batch_valid_length"] = ms.Tensor.from_numpy(np.expand_dims(seq_lens_np, 0))
-        model_inputs["block_tables"] = attn_metadata.block_tables
-        model_inputs["slot_mapping"] = attn_metadata.slot_mapping
-        model_inputs["position_ids"] = position_ids
-        model_inputs["q_seq_lens"] = q_seq_lens
-        model_inputs["attention_mask"] = attention_mask
-        model_inputs["key_cache"] = key_cache
-        model_inputs["value_cache"] = value_cache
-
-        return model_inputs, is_prefill
+    def prepare_inputs(self, input_ids, positions):
+        return self.prepare_base_inputs(input_ids, positions)
 
     def update_model_inputs(self, model_inputs, **kwargs):
         return model_inputs
 
-    def forward(
-        self,
-        input_ids: Tensor,
-        positions: Tensor,
-        kv_caches: List[Tensor],
-        attn_metadata: AttentionMetadata,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[Tensor] = None,
-        **kwargs
-    ) -> Union[Tensor, IntermediateTensors]:
-        model_inputs, is_prefill = self.prepare_inputs(input_ids, positions, attn_metadata)
+    def forward(self,
+                input_ids: Tensor,
+                positions: Tensor,
+                intermediate_tensors: Optional[IntermediateTensors] = None,
+                inputs_embeds: Optional[Tensor] = None,
+                **kwargs) -> Union[Tensor, IntermediateTensors]:
+        model_inputs, is_prefill = self.prepare_inputs(input_ids, positions)
         model_inputs = self.update_model_inputs(model_inputs, **kwargs)
 
+        # enable_mb_split is True in lager EP enable micro-batch and per-dp-bs > 1
+        enable_mb_split = self.is_enable_micro_batch_split(
+            is_prefill, model_inputs["q_seq_lens"])
+
         if is_prefill:
-            self.network.phase = "prefill"
-            if not self.set_flags:
-                self.network.add_flags_custom(is_first_iteration=True)
+            if self.enable_micro_batch:
+                self.network.phase = "prefill" if not enable_mb_split else "prefill_micro_batch"
+                if not self.set_flags or is_pynative() or enable_mb_split:
+                    self.network.add_flags_custom(is_first_iteration=True)
+                    self.network.add_flags_enable_micro_batch(
+                        enable_micro_batch=enable_mb_split)
+            else:
+                self.network.phase = "prefill"
+                if not self.set_flags or is_pynative():
+                    self.network.add_flags_custom(is_first_iteration=True)
+
             hidden_states = self.network(**model_inputs)
             self.network.phase = "increment"
-            if not self.set_flags:
+            if not self.set_flags or is_pynative():
                 self.network.add_flags_custom(is_first_iteration=False)
                 self.set_flags = True
         else:
@@ -164,15 +141,21 @@ class MfModelBase(MsModelBase):
         hidden_states: Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[Tensor]:
-        selected_token_indices = sampling_metadata.selected_token_indices
-        if selected_token_indices is not None and selected_token_indices.numel() <= 0:
-            logits = ms.mint.zeros((0, self.mf_model_config.vocab_size),
-                                    dtype=self.mf_model_config.compute_dtype)
+        if sampling_metadata is not None:
+            selected_token_indices = sampling_metadata.selected_token_indices
+            if selected_token_indices is not None and selected_token_indices.numel(
+            ) <= 0:
+                logits = ms.mint.zeros(
+                    (0, self.mf_model_config.vocab_size),
+                    dtype=self.mf_model_config.compute_dtype)
+            else:
+                hidden_states = hidden_states.index_select(
+                    0, selected_token_indices)
+                logits = self.lm_head(hidden_states)
+                logits = logits.view(-1, logits.shape[-1])
         else:
-            hidden_states = hidden_states.index_select(0, selected_token_indices)
             logits = self.lm_head(hidden_states)
-            logits = logits.reshape(-1, logits.shape[-1])
-
+            logits = logits.view(-1, logits.shape[-1])
         return logits
 
     def sample(
@@ -186,3 +169,15 @@ class MfModelBase(MsModelBase):
 
     def load_weights(self, weights: Iterable[Tuple[str, Tensor]]) -> Set[str]:
         raise NotImplementedError("load_weight not implemented.")
+
+    def is_enable_micro_batch_split(self, is_prefill, q_seq_lens):
+        """Judge enable micro batch """
+        if self.enable_micro_batch:
+            is_prefill_cur_dp = mint.ones(
+                (1), dtype=ms.int8) if is_prefill else mint.zeros(
+                    (1), dtype=ms.int8)
+            is_prefill_all_dp = get_dp_group().all_gather(is_prefill_cur_dp)
+            return is_prefill_all_dp.sum(
+            ) == self.dp_size and q_seq_lens.shape[0] > 1
+        else:
+            return False

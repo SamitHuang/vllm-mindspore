@@ -34,10 +34,9 @@ from research.deepseek3.deepseek3 import (
 )
 
 from vllm_mindspore.model_executor.layers.sampler import get_sampler
-from vllm_mindspore.model_executor.models.model_base import Fake_MLA
+from vllm_mindspore.model_executor.models.model_base import MLAAttentionWrapper
 from vllm_mindspore.model_executor.models.mf_models.mf_model_base import MfModelBase
 from vllm_mindspore.model_executor.models.mf_models.deepseekv3_weight_processor import DeepseekV3WeightProcessor
-from vllm_mindspore.model_executor.models.mf_models.attention_mask import LowerTriangularMask
 
 logger = init_logger(__name__)
 
@@ -51,7 +50,7 @@ class DeepseekV3MTPForCausalLM(MfModelBase):
         self.sampler = get_sampler()
         self.set_modules({"model": self.network})
 
-        self.kv_caches = [Fake_MLA() for i in range(self.mf_model_config.num_layers)]
+        self.kv_caches = [MLAAttentionWrapper() for i in range(self.mf_model_config.num_layers)]
         compilation_config = get_current_vllm_config().compilation_config
 
         if prefix in compilation_config.static_forward_context:
@@ -59,7 +58,6 @@ class DeepseekV3MTPForCausalLM(MfModelBase):
         for i in range(self.mf_model_config.num_nextn_predict_layers):
             compilation_config.static_forward_context[str(i)] = self.kv_caches[i]
 
-        self.casual_mask = LowerTriangularMask(mf_model_config=self.mf_model_config)
         self.set_flags = False
 
 
@@ -112,4 +110,6 @@ class DeepseekV3MTPForCausalLM(MfModelBase):
         weight_processor = DeepseekV3WeightProcessor(self.mf_config, self.network, False)
         weight_processor.load_safetensors_shard(self.mf_config.load_checkpoint, is_mtp_model=True)
         self.network.set_dynamic_inputs()
+        dynamic_hidden_states = Tensor(shape=[None, None], dtype=self.mf_model_config.compute_dtype)
+        self.lm_head.set_inputs(dynamic_hidden_states)
         return None

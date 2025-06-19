@@ -21,7 +21,6 @@ from abc import abstractmethod
 
 import numpy as np
 import mindspore as ms
-from mindspore.ops import operations as P
 from mindspore import mint, ops, Tensor
 from mindspore import Parameter
 
@@ -33,14 +32,13 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.linear import adjust_scalar_to_fused_array, adjust_marlin_shard, adjust_bitsandbytes_4bit_shard
+from vllm.config import get_current_vllm_config
 from vllm_mindspore.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from vllm_mindspore.model_executor.utils import set_weight_attrs
 from vllm_mindspore.distributed.communication_op import ReduceFromModelParallelRegion
-
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
@@ -60,7 +58,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "HQQMarlinMethod",
     "QuarkLinearMethod"
 ]
-
 
 
 class LinearMethodBase(QuantizeMethodBase):
@@ -112,7 +109,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
         input_size: int,
         output_size: int,
         params_dtype,
-        use_ops_dense: bool = False,
         **extra_weight_attrs
     ):
         weight = Parameter(
@@ -130,10 +126,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
         self.matmul = ops.MatMul(transpose_b=True)
         self.bias_add = ops.Add()
-        self.dense = P.Dense()
-        self.use_ops_dense = use_ops_dense
 
-    def apply_(self,
+    def apply(self,
               layer: ms.nn.Cell,
               x: Tensor,
               bias: Parameter = None):
@@ -144,14 +138,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
             x = self.bias_add(x, bias)
         x = x.reshape(output_shape)
         return x
-
-    def apply(self,
-              layer: ms.nn.Cell,
-              x: Tensor,
-              bias: Parameter = None):
-        if self.use_ops_dense:
-            return self.dense(x, layer.weight, bias)
-        return self.apply_(layer, x, bias=bias)
 
 
 class LinearBase(ms.nn.Cell):
@@ -174,6 +160,8 @@ class LinearBase(ms.nn.Cell):
         params_dtype=None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        return_bias: bool = True,
     ):
         super().__init__()
 
@@ -182,77 +170,19 @@ class LinearBase(ms.nn.Cell):
         self.output_size = output_size
         self.skip_bias_add = skip_bias_add
         if params_dtype is None:
-            # params_dtype = torch.get_default_dtype()
-            params_dtype = ms.float16
+            params_dtype = get_current_vllm_config().model_config.dtype
         self.params_dtype = params_dtype
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+        self.return_bias = return_bias
 
     def construct(self, x: ms.Tensor) -> ms.Tensor:
         raise NotImplementedError
 
     def weight_loader(self):
         return None
-
-class ReplicatedLinear(LinearBase):
-    def __init__(self,
-                 input_size: int,
-                 output_size: int,
-                 bias: bool = True,
-                 skip_bias_add: bool = False,
-                 params_dtype: Optional[ms.Type] = None,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
-        super().__init__(input_size,
-                         output_size,
-                         skip_bias_add,
-                         params_dtype,
-                         quant_config,
-                         prefix=prefix)
-
-        # All the linear layer supports quant method.
-        assert self.quant_method is not None
-        self.quant_method.create_weights(self,
-                                         self.input_size, [self.output_size],
-                                         self.input_size,
-                                         self.output_size,
-                                         self.params_dtype,
-                                         use_ops_dense=True,
-                                         weight_loader=self.weight_loader)
-
-        if bias:
-            self.bias = Parameter(
-                mint.zeros(self.output_size, dtype=self.params_dtype))
-            set_weight_attrs(self.bias, {
-                "output_dim": 0,
-                "weight_loader": self.weight_loader,
-            })
-        else:
-            self.bias = None
-
-    def weight_loader(self, param: Parameter, loaded_weight: ms.Tensor):
-        # If the weight on disk does not have a shape, give it one
-        # (such scales for AutoFp8).
-        if len(loaded_weight.shape) == 0:
-            loaded_weight = loaded_weight.reshape(1)
-
-        assert param.shape == loaded_weight.shape
-        param.data.set_data(loaded_weight)
-
-    def construct(self, x: ms.Tensor) -> tuple[ms.Tensor, Optional[Parameter]]:
-        bias = self.bias if not self.skip_bias_add else None
-        assert self.quant_method is not None
-        output = self.quant_method.apply(self, x, bias)
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
-
-    def extra_repr(self) -> str:
-        s = f"in_features={self.input_size}"
-        s += f", output_features={self.output_size}"
-        s += f", bias={self.bias is not None}"
-        return s
 
 
 class ColumnParallelLinear(LinearBase):
@@ -267,9 +197,11 @@ class ColumnParallelLinear(LinearBase):
         quant_config: Optional[QuantizationConfig] = None,
         output_sizes: Optional[List[int]] = None,
         prefix: str = "",
+        *,
+        return_bias: bool = True,
     ):
         super().__init__(
-            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
+            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix, return_bias=return_bias
         )
 
         self.gather_output = gather_output
@@ -303,7 +235,7 @@ class ColumnParallelLinear(LinearBase):
         )
         if bias:
             self.bias = Parameter(
-                mint.zeros(self.output_size_per_partition, dtype=params_dtype)
+                mint.zeros(self.output_size_per_partition, dtype=self.params_dtype)
             )
             set_weight_attrs(
                 self.bias,
@@ -328,6 +260,8 @@ class ColumnParallelLinear(LinearBase):
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
+        if not self.return_bias:
+            return output
         return output, output_bias
 
     def weight_loader(self, param, loaded_weight):
@@ -398,6 +332,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         params_dtype=None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        return_bias: bool = True
     ):
         self.output_sizes = output_sizes
         tp_size = get_tensor_model_parallel_world_size()
@@ -411,6 +347,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=prefix,
+            return_bias=return_bias
         )
 
     def weight_loader(
@@ -468,6 +405,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         params_dtype=None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        return_bias: bool = True,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -503,78 +442,17 @@ class QKVParallelLinear(ColumnParallelLinear):
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=prefix,
+            return_bias=return_bias
         )
 
-    def weight_loader(self, param, loaded_weight, loaded_shard_id = None):
-        param_data = param.data
+    def weight_loader(self, param, loaded_weight, loaded_shard_id):
         output_dim = getattr(param, "output_dim", None)
-
-        # Special case for per-tensor scales in fused case.
-        needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
-
-        if loaded_shard_id is None:
-            # Loaded weight is already fused on disk (qkv).
-            # (e.g., Phi-3's qkv_proj).
-            if output_dim is None:
-                if needs_scalar_to_array:
-                    param_data, loaded_weight = adjust_scalar_to_fused_array(
-                        param_data, loaded_weight, 0)
-
-                assert param_data.shape == loaded_weight.shape
-                param.set_data(loaded_weight)
-                return
-            shard_offsets = [
-                # (shard_id, shard_offset, shard_size)
-                ("q", 0, self.total_num_heads * self.head_size),
-                ("k", self.total_num_heads * self.head_size,
-                 self.total_num_kv_heads * self.head_size),
-                ("v", (self.total_num_heads + self.total_num_kv_heads) *
-                 self.head_size, self.total_num_kv_heads * self.head_size),
-            ]
-            use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit",
-                                            False)
-            packed_dim = getattr(param, "packed_dim", None)
-            for shard_id, shard_offset, shard_size in shard_offsets:
-                # Special case for Quantized Weights.
-                # If quantized, we need to adjust the offset and size to account
-                # for the packing.
-                if packed_dim == output_dim:
-                    shard_size = shard_size // param.pack_factor
-                    shard_offset = shard_offset // param.pack_factor
-
-                    # Special case for Marlin.
-                    shard_size, shard_offset = adjust_marlin_shard(
-                        param, shard_size, shard_offset)
-
-                if use_bitsandbytes_4bit:
-                    orig_qkv_offsets = {
-                        "q": (0, self.total_num_heads * self.head_size),
-                        "k": (self.total_num_heads * self.head_size,
-                              self.total_num_kv_heads * self.head_size),
-                        "v":
-                        ((self.total_num_heads + self.total_num_kv_heads) *
-                         self.head_size,
-                         self.total_num_kv_heads * self.head_size),
-                        "total":
-                        ((self.total_num_heads + 2 * self.total_num_kv_heads) *
-                         self.head_size, 0)
-                    }
-
-                    shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
-                        param, orig_qkv_offsets, shard_id)
-
-                loaded_weight_shard = loaded_weight.narrow(
-                    output_dim, shard_offset, shard_size)
-                self.weight_loader(param, loaded_weight_shard, shard_id)
-            return
-
-
         tp_rank = get_tensor_model_parallel_rank()
         assert loaded_shard_id in ["q", "k", "v"]
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
         # If output dim is defined, use the default loading process.
         # if output_dim is not None:
-
+        param_data = param.data
         if True:
             if loaded_shard_id == "q":
                 shard_offset = 0
@@ -628,9 +506,11 @@ class RowParallelLinear(LinearBase):
         reduce_results: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        return_bias: bool = True,
     ):
         super().__init__(
-            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
+            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix, return_bias=return_bias
         )
 
         # Divide the weight matrix along the last dimension.
@@ -664,7 +544,7 @@ class RowParallelLinear(LinearBase):
             )
 
         if bias:
-            self.bias = Parameter(mint.zeros(self.output_size, dtype=params_dtype))
+            self.bias = Parameter(mint.zeros(self.output_size, dtype=self.params_dtype))
             set_weight_attrs(
                 self.bias,
                 {
@@ -700,7 +580,8 @@ class RowParallelLinear(LinearBase):
             output = output_parallel
 
         output_bias = self.bias if self.skip_bias_add else None
-
+        if not self.return_bias:
+            return output
         return output, output_bias
 
     def weight_loader(self, param, loaded_weight):
