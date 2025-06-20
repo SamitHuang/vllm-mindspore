@@ -21,7 +21,7 @@ from typing import Iterable, List, Optional, Set, Tuple, Union, Dict
 import numpy as np
 
 import mindspore as ms
-from mindspore import Tensor, mutable, nn
+from mindspore import Tensor, mutable, nn, Parameter
 
 from vllm.attention.backends.abstract import AttentionType
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -131,6 +131,14 @@ class MsModelBase:
         self._check_modules_valid()
 
         for cell_name, module in self.modules_dict.items():
+            if isinstance(module, Parameter):
+                yield cell_name, module
+                continue
+            elif isinstance(module, MsModelBase):
+                for par_name, par in module.named_parameters():
+                    yield par_name, par
+                continue
+
             for par_name, par in module.parameters_and_names():
                 if cell_name != "self":
                     par_name = cell_name + "." + par_name
@@ -142,6 +150,14 @@ class MsModelBase:
 
         params_dict = dict()
         for name, module in self.modules_dict.items():
+            if isinstance(module, Parameter):
+                params_dict[name] = module
+                continue
+            elif isinstance(module, MsModelBase):
+                module_params = module.get_params_dict()
+                params_dict.update(module_params)
+                continue
+
             module_params = module.parameters_dict()
             if name != "self":
                 new_module_params = dict()
@@ -156,6 +172,13 @@ class MsModelBase:
         self._check_modules_valid()
 
         for name, module in self.modules_dict.items():
+            if isinstance(module, Parameter):
+                continue
+            elif isinstance(module, MsModelBase):
+                for module_name, sub_module in module.named_modules():
+                    yield module_name, sub_module
+                continue
+
             for module_name, sub_module in module.cells_and_names():
                 if name != "self":
                     module_name = name + "." + module_name
@@ -178,6 +201,12 @@ class MsModelBase:
         self._check_modules_valid()
 
         for _, module in self.modules_dict.items():
+            if isinstance(module, Parameter):
+                continue
+            elif isinstance(module, MsModelBase):
+                module.eval()
+                continue
+
             module.set_train(False)
 
         return self
@@ -190,13 +219,15 @@ class MsModelBase:
         inputs_embeds: Optional[Tensor] = None,
         previous_hidden_states: Optional[Tensor] = None,
         spec_step_idx: int = 0,
+        **kwargs,
     ) -> Union[Tensor, IntermediateTensors]:
         return self.forward(input_ids,
                             positions,
                             intermediate_tensors,
                             inputs_embeds,
                             previous_hidden_states=previous_hidden_states,
-                            spec_step_idx=spec_step_idx)
+                            spec_step_idx=spec_step_idx,
+                            **kwargs)
 
     def forward(self,
                 input_ids: Tensor,
@@ -241,8 +272,13 @@ class MsModelBase:
         raise NotImplementedError("Function load_weights should be Implemented!")
 
 
-    def _dummy_attention_metadata(self, input_ids: Tensor, positions: Tensor):
-        input_len = input_ids.shape[0]
+    def _dummy_attention_metadata(self, input_ids: Optional[Tensor], positions: Tensor):
+        if input_ids is not None:
+            input_len = input_ids.shape[0]
+        elif positions.ndim == 1:
+            input_len = positions.shape[0]
+        else:
+            raise RuntimeError("unknown input length")
         max_seq_len = ms.Tensor(input_len, dtype=ms.int32)
         seq_lengths = ms.Tensor([input_len], dtype=ms.int32)
         q_seq_lens_np = np.array([input_len], dtype=np.int32)
@@ -298,15 +334,14 @@ class MsModelBase:
             seq_lens_np = attn_metadata.seq_lens_np
         
         q_seq_lens = ms.Tensor(query_lens_np, dtype=ms.int32)
-        position_ids = ms.Tensor(positions, dtype=ms.int32)
         attention_mask = self.casual_mask.gen_attention_mask(is_prefill, positions, query_lens_np)
 
         model_inputs = {}
-        model_inputs["input_ids"] = input_ids.astype(ms.int32)
+        model_inputs["input_ids"] = input_ids
         model_inputs["batch_valid_length"] = ms.from_numpy(seq_lens_np)
         model_inputs["block_tables"] = attn_metadata.block_tables
         model_inputs["slot_mapping"] = attn_metadata.slot_mapping
-        model_inputs["position_ids"] = position_ids
+        model_inputs["position_ids"] = positions
         model_inputs["q_seq_lens"] = q_seq_lens
         model_inputs["attention_mask"] = attention_mask
         model_inputs["key_cache"] = key_cache
@@ -340,9 +375,26 @@ class NativeModel(MsModelBase):
             compilation_config.static_forward_context[str(i)] = self.kv_caches[i]
 
 
-    def set_model_inputs(self, is_prefill):
-        dyn_input_ids = Tensor(shape=[None], dtype=mstype.int32)
-        dyn_position_ids = Tensor(shape=[None], dtype=mstype.int32)
+    def set_model_inputs(self, input_ids, position_ids, intermediate_tensors, inputs_embeds, is_prefill):
+        if input_ids is None:
+            dyn_input_ids = None
+        else:
+            dyn_input_ids = ms.Tensor(shape=[None] * input_ids.ndim, dtype=input_ids.dtype)
+
+        if position_ids is None:
+            dyn_position_ids = None
+        else:
+            dyn_position_ids = ms.Tensor(shape=[None] * position_ids.ndim, dtype=position_ids.dtype)
+
+        if inputs_embeds is None:
+            dyn_inputs_embeds = None
+        else:
+            dyn_inputs_embeds = ms.Tensor(shape=[None] * inputs_embeds.ndim, dtype=inputs_embeds.dtype)
+
+        if intermediate_tensors is None:
+            dyn_intermediate_tensors = None
+        else:
+            dyn_intermediate_tensors = ms.Tensor(shape=[None] * intermediate_tensors.ndim, dtype=intermediate_tensors.dtype)
 
         block_size = self.cache_config.block_size
         num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
@@ -366,8 +418,6 @@ class NativeModel(MsModelBase):
         dyn_batch_valid_length = Tensor(shape=[None,], dtype=mstype.int32)
         dyn_q_seq_lens = Tensor(shape=[None, ], dtype=mstype.int32)
         dyn_block_tables = Tensor(shape=[None, None], dtype=mstype.int32)
-        dyn_intermediate_tensors = None
-        dyn_inputs_embeds = None
         self.model.set_inputs(
             dyn_input_ids,
             dyn_position_ids,
@@ -403,7 +453,7 @@ class NativeModel(MsModelBase):
         model_inputs, is_prefill = self.prepare_inputs(input_ids, positions, intermediate_tensors, inputs_embeds)
 
         if self.prev_prefill != is_prefill and self.is_graph_mode:
-            self.set_model_inputs(is_prefill)
+            self.set_model_inputs(input_ids, positions, intermediate_tensors, inputs_embeds, is_prefill)
         self.prev_prefill = is_prefill
 
         # for dummy_attention_metadata 

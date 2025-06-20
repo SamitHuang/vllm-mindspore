@@ -16,7 +16,7 @@
 # limitations under the License.
 # ============================================================================
 
-from typing import List, Optional
+from typing import List, Optional, Union
 from abc import abstractmethod
 
 import numpy as np
@@ -33,6 +33,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.config import get_current_vllm_config
+from vllm.model_executor.layers.linear import adjust_scalar_to_fused_array, adjust_marlin_shard, adjust_bitsandbytes_4bit_shard
 from vllm_mindspore.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -183,6 +184,70 @@ class LinearBase(ms.nn.Cell):
 
     def weight_loader(self):
         return None
+
+
+class ReplicatedLinear(LinearBase):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        *,
+        return_bias: bool = True,
+    ):
+        super().__init__(input_size,
+                         output_size,
+                         skip_bias_add,
+                         params_dtype,
+                         quant_config,
+                         prefix=prefix,
+                         return_bias=return_bias)
+
+        # All the linear layer supports quant method.
+        assert self.quant_method is not None
+        self.quant_method.create_weights(self,
+                                         self.input_size, [self.output_size],
+                                         self.input_size,
+                                         self.output_size,
+                                         self.params_dtype,
+                                         weight_loader=self.weight_loader)
+
+        if bias:
+            self.bias = Parameter(
+                mint.zeros(self.output_size, dtype=self.params_dtype))
+            set_weight_attrs(self.bias, {
+                "output_dim": 0,
+                "weight_loader": self.weight_loader,
+            })
+        else:
+            self.bias = None
+            # self.register_parameter("bias", None)
+
+    def weight_loader(self, param: Parameter, loaded_weight: Tensor):
+        # If the weight on disk does not have a shape, give it one
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+
+        assert param.shape == loaded_weight.shape, (
+            f"Tried to load weights of size {loaded_weight.shape}"
+            f"to a parameter of size {param.shape}")
+        # param.data.copy_(loaded_weight)
+        param.set_data(loaded_weight)
+
+    def construct(
+        self, x: Tensor
+    ) -> Union[Tensor, tuple[Tensor, Optional[Parameter]]]:
+        bias = self.bias if not self.skip_bias_add else None
+        assert self.quant_method is not None
+        output = self.quant_method.apply(self, x, bias)
+        output_bias = self.bias if self.skip_bias_add else None
+        if not self.return_bias:
+            return output
+        return output, output_bias
 
 
 class ColumnParallelLinear(LinearBase):
@@ -445,14 +510,76 @@ class QKVParallelLinear(ColumnParallelLinear):
             return_bias=return_bias
         )
 
-    def weight_loader(self, param, loaded_weight, loaded_shard_id):
+    def weight_loader(self, param, loaded_weight, loaded_shard_id = None):
+        param_data = param.data
         output_dim = getattr(param, "output_dim", None)
+
+        # Special case for per-tensor scales in fused case.
+        needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
+
+        if loaded_shard_id is None:
+            # Loaded weight is already fused on disk (qkv).
+            # (e.g., Phi-3's qkv_proj).
+            if output_dim is None:
+                if needs_scalar_to_array:
+                    param_data, loaded_weight = adjust_scalar_to_fused_array(
+                        param_data, loaded_weight, 0)
+
+                assert param_data.shape == loaded_weight.shape
+                param.set_data(loaded_weight)
+                return
+            shard_offsets = [
+                # (shard_id, shard_offset, shard_size)
+                ("q", 0, self.total_num_heads * self.head_size),
+                ("k", self.total_num_heads * self.head_size,
+                 self.total_num_kv_heads * self.head_size),
+                ("v", (self.total_num_heads + self.total_num_kv_heads) *
+                 self.head_size, self.total_num_kv_heads * self.head_size),
+            ]
+            use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit",
+                                            False)
+            packed_dim = getattr(param, "packed_dim", None)
+            for shard_id, shard_offset, shard_size in shard_offsets:
+                # Special case for Quantized Weights.
+                # If quantized, we need to adjust the offset and size to account
+                # for the packing.
+                if packed_dim == output_dim:
+                    shard_size = shard_size // param.pack_factor
+                    shard_offset = shard_offset // param.pack_factor
+
+                    # Special case for Marlin.
+                    shard_size, shard_offset = adjust_marlin_shard(
+                        param, shard_size, shard_offset)
+
+                if use_bitsandbytes_4bit:
+                    orig_qkv_offsets = {
+                        "q": (0, self.total_num_heads * self.head_size),
+                        "k": (self.total_num_heads * self.head_size,
+                              self.total_num_kv_heads * self.head_size),
+                        "v":
+                        ((self.total_num_heads + self.total_num_kv_heads) *
+                         self.head_size,
+                         self.total_num_kv_heads * self.head_size),
+                        "total":
+                        ((self.total_num_heads + 2 * self.total_num_kv_heads) *
+                         self.head_size, 0)
+                    }
+
+                    shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
+                        param, orig_qkv_offsets, shard_id)
+
+                loaded_weight_shard = loaded_weight.narrow(
+                    output_dim, shard_offset, shard_size)
+                self.weight_loader(param, loaded_weight_shard, shard_id)
+            return
+
+
         tp_rank = get_tensor_model_parallel_rank()
         assert loaded_shard_id in ["q", "k", "v"]
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
         # If output dim is defined, use the default loading process.
         # if output_dim is not None:
-        param_data = param.data
+
         if True:
             if loaded_shard_id == "q":
                 shard_offset = 0

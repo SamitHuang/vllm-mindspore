@@ -11,6 +11,7 @@ import mindspore.nn as nn
 import mindspore.ops as ops
 from transformers import Blip2VisionConfig, BlipVisionConfig
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.model_executor.models.interfaces import SupportsQuant
 from vllm_mindspore.model_executor.layers.activation import get_act_fn
 from vllm_mindspore.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -39,7 +40,11 @@ def get_blip_num_patches(*, image_size: int, patch_size: int) -> int:
 
 class BlipVisionEmbeddings(nn.Cell):
 
-    def __init__(self, config: Union[BlipVisionConfig, Blip2VisionConfig]) -> None:
+    def __init__(
+        self,
+        config: Union[BlipVisionConfig, Blip2VisionConfig],
+        dtype: ms.Type = ms.float32,
+    ) -> None:
         super().__init__()
 
         self.config = config
@@ -48,7 +53,7 @@ class BlipVisionEmbeddings(nn.Cell):
         self.patch_size = config.patch_size
 
         self.class_embedding = ms.Parameter(
-            mint.randn(1, 1, self.embed_dim, dtype=ms.bfloat16)
+            mint.randn(1, 1, self.embed_dim, dtype=dtype)
         )
 
         self.patch_embedding = mint.nn.Conv2d(
@@ -56,7 +61,7 @@ class BlipVisionEmbeddings(nn.Cell):
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
             stride=self.patch_size,
-            dtype=ms.bfloat16,
+            dtype=dtype,
         )
 
         self.num_patches = get_blip_num_patches(
@@ -65,15 +70,14 @@ class BlipVisionEmbeddings(nn.Cell):
         self.num_positions = self.num_patches + 1
 
         self.position_embedding = ms.Parameter(
-            mint.randn(1, self.num_positions, self.embed_dim, dtype=ms.bfloat16)
+            mint.randn(1, self.num_positions, self.embed_dim, dtype=dtype)
         )
 
     def construct(self, pixel_values: ms.Tensor) -> ms.Tensor:
         batch_size = pixel_values.shape[0]
         target_dtype = self.patch_embedding.weight.dtype
-        patch_embeds = self.patch_embedding(
-            pixel_values.to(dtype=target_dtype)
-        )  # shape = [*, width, grid, grid]
+        # shape = [*, width, grid, grid]
+        patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
         patch_embeds = mint.transpose(patch_embeds.flatten(2), 1, 2)
 
         class_embeds = mint.broadcast_to(self.class_embedding, (batch_size, 1, -1))
@@ -93,6 +97,7 @@ class BlipAttention(nn.Cell):
         config: Union[BlipVisionConfig, Blip2VisionConfig],
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        dtype: ms.Type = ms.float32,
     ) -> None:
         super().__init__()
         self.config = config
@@ -113,16 +118,16 @@ class BlipAttention(nn.Cell):
             self.head_dim,
             self.num_heads,
             bias=config.qkv_bias,
-            params_dtype=ms.bfloat16,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv",
+            params_dtype=dtype,
         )
         self.projection = RowParallelLinear(
             self.embed_dim,
             self.embed_dim,
             quant_config=quant_config,
-            params_dtype=ms.bfloat16,
             prefix=f"{prefix}.projection",
+            params_dtype=dtype,
         )
 
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -185,6 +190,7 @@ class BlipMLP(nn.Cell):
         config: BlipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        dtype: ms.Type = ms.float32,
     ) -> None:
         super().__init__()
 
@@ -195,17 +201,17 @@ class BlipMLP(nn.Cell):
             config.hidden_size,
             config.intermediate_size,
             bias=True,
-            params_dtype=ms.bfloat16,
             quant_config=quant_config,
             prefix=f"{prefix}.fc1",
+            params_dtype=dtype,
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=True,
-            params_dtype=ms.bfloat16,
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
+            params_dtype=dtype,
         )
 
     def construct(self, hidden_states: ms.Tensor) -> ms.Tensor:
@@ -223,21 +229,22 @@ class BlipEncoderLayer(nn.Cell):
         config: BlipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        dtype: ms.Type = ms.float32,
     ) -> None:
         super().__init__()
 
         # fallback to sdpa attention if tp unavailable
         self.self_attn = BlipAttention(
-            config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
+            config, quant_config=quant_config, prefix=f"{prefix}.self_attn", dtype=dtype
         )
         self.layer_norm1 = mint.nn.LayerNorm(
-            config.hidden_size, eps=config.layer_norm_eps, dtype=ms.bfloat16
+            config.hidden_size, eps=config.layer_norm_eps, dtype=dtype
         )
-        self.mlp = BlipMLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
+        self.mlp = BlipMLP(
+            config, quant_config=quant_config, prefix=f"{prefix}.mlp", dtype=dtype
+        )
         self.layer_norm2 = mint.nn.LayerNorm(
-            config.hidden_size, eps=config.layer_norm_eps, dtype=ms.bfloat16
+            config.hidden_size, eps=config.layer_norm_eps, dtype=dtype
         )
 
     def construct(self, hidden_states: ms.Tensor) -> ms.Tensor:
@@ -270,6 +277,7 @@ class BlipEncoder(nn.Cell):
         quant_config: Optional[QuantizationConfig] = None,
         num_hidden_layers_override: Optional[int] = None,
         prefix: str = "",
+        dtype: ms.Type = ms.float32,
     ) -> None:
         super().__init__()
 
@@ -286,12 +294,13 @@ class BlipEncoder(nn.Cell):
                     config=config,
                     quant_config=quant_config,
                     prefix=f"{prefix}.layers.{layer_idx}",
+                    dtype=dtype,
                 )
                 for layer_idx in range(num_hidden_layers)
             ]
         )
 
-    def construct(self, inputs_embeds: ms.Tensor):
+    def construct(self, inputs_embeds: ms.Tensor) -> ms.Tensor:
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(hidden_states)
@@ -299,9 +308,10 @@ class BlipEncoder(nn.Cell):
         return hidden_states
 
 
-class BlipVisionModel(nn.Cell):
+class BlipVisionModel(nn.Cell, SupportsQuant):
     config_class = BlipVisionConfig
     main_input_name = "pixel_values"
+    packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
 
     def __init__(
         self,
@@ -311,16 +321,18 @@ class BlipVisionModel(nn.Cell):
         num_hidden_layers_override: Optional[int] = None,
         require_post_norm: Optional[bool] = None,
         prefix: str = "",
+        dtype: ms.Type = ms.float32,
     ) -> None:
         super().__init__()
         self.config = config
 
-        self.embeddings = BlipVisionEmbeddings(config)
+        self.embeddings = BlipVisionEmbeddings(config, dtype=dtype)
         self.encoder = BlipEncoder(
             config=config,
             quant_config=quant_config,
             num_hidden_layers_override=num_hidden_layers_override,
             prefix=f"{prefix}.encoder",
+            dtype=dtype,
         )
 
         num_hidden_layers = config.num_hidden_layers
@@ -336,12 +348,11 @@ class BlipVisionModel(nn.Cell):
 
         if require_post_norm:
             self.post_layernorm = mint.nn.LayerNorm(
-                config.hidden_size, eps=config.layer_norm_eps, dtype=ms.bfloat16
+                config.hidden_size, eps=config.layer_norm_eps, dtype=dtype
             )
         else:
             self.post_layernorm = None
 
-    @ms.jit(jit_level="O0", infer_boost="on")
     def construct(self, pixel_values: ms.Tensor) -> ms.Tensor:
         hidden_states = self.embeddings(pixel_values)
         hidden_states = self.encoder(inputs_embeds=hidden_states)

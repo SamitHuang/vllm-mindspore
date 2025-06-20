@@ -16,7 +16,7 @@
 # ============================================================================
 
 from dataclasses import dataclass, field
-from typing import Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import mindspore as ms
 from mindspore import mint, ops
@@ -141,6 +141,38 @@ def make_layers(
         for idx in range(start_layer, end_layer)
     ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
     return start_layer, end_layer, modules
+
+
+# NOTE: don't use lru_cache here because it can prevent garbage collection
+_model_to_pp_missing_layer_names: Dict[int, List[str]] = {}
+
+
+def get_pp_missing_layer_names(model: ms.nn.Cell) -> List[str]:
+    """Get the names of the missing layers in a pipeline parallel model."""
+    model_id = id(model)
+    if model_id in _model_to_pp_missing_layer_names:
+        return _model_to_pp_missing_layer_names[model_id]
+
+    missing_layer_names = []
+    for name, module in model.named_modules():
+        if isinstance(module, PPMissingLayer):
+            # NOTE: the trailing dot is used to match the prefix of the layer.
+            # without the dot, we could match a layer that is not missing,
+            # e.g., 'encoder.layer.1' would match 'encoder.layer.11'
+            missing_layer_names.append(name + '.')
+    _model_to_pp_missing_layer_names[model_id] = missing_layer_names
+
+    return missing_layer_names
+
+
+def is_pp_missing_parameter(name: str, model: ms.nn.Cell) -> bool:
+    """Check if a parameter is missing in a pipeline parallel model."""
+    if isinstance(model, PPMissingLayer):
+        return True
+
+    return any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in get_pp_missing_layer_names(model))
 
 
 def make_empty_intermediate_tensors_factory(keys: List[str], hidden_size: int):
