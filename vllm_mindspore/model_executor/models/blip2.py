@@ -704,14 +704,21 @@ class Blip2ForConditionalGeneration(
     def load_weights(self, weights: Iterable[Tuple[str, ms.Tensor]]) -> Set[str]:
         params_dict = self.get_params_dict()
         dtype = self.model_config.dtype
+        loaded_params: Set[str] = set()
         for name, weight in weights:
+            weight = weight.to(dtype)
             if "vision_model." in name:
-                self.vision_model.load_weights([(name, weight.to(dtype))], params_dict)
+                loaded_param = self.vision_model.load_weights(
+                    [(name, weight)], params_dict
+                )
             elif "language_model." in name:
-                self.language_model.load_weights(
-                    [(name.replace("language_model.", ""), weight.to(dtype))]
+                loaded_param = self.language_model.load_weights(
+                    [(name.replace("language_model.", ""), weight)]
                 )
             else:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight.to(dtype))
+                weight_loader(param, weight)
+                loaded_param = set([name])
+            loaded_params.update(loaded_param)
+        return loaded_params
