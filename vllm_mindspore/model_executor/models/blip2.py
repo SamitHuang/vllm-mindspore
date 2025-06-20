@@ -22,7 +22,7 @@ from vllm.model_executor.models.blip2 import (
 from vllm.model_executor.models.interfaces import SupportsPP, SupportsQuant
 from vllm.model_executor.models.utils import flatten_bn
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.multimodal import MULTIMODAL_REGISTRY, NestedTensors
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm_mindspore.model_executor.layers.activation import get_act_fn
 from vllm_mindspore.model_executor.layers.quantization.base_config import (
@@ -438,9 +438,8 @@ class Blip2ForConditionalGeneration(
             dtype=dtype,
         )
 
-        vllm_config = vllm_config.with_hf_config(config.text_config)
         self.language_model = OPTForCausalLM(
-            vllm_config=vllm_config,
+            vllm_config=vllm_config.with_hf_config(config.text_config),
             prefix=maybe_prefix(prefix, "language_model"),
         )
 
