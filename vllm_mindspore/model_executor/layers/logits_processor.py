@@ -21,8 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import mindspore.nn as nn
-from mindspore import Tensor
-from mindspore import mint
+from mindspore import Tensor, ops, mint, nn
 
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config
@@ -33,7 +32,7 @@ from vllm.distributed import (
 from vllm_mindspore.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from vllm_mindspore.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.platforms import current_platform
 
 
@@ -74,9 +73,8 @@ class LogitsProcessor(nn.Cell):
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
         parallel_config = get_current_vllm_config().parallel_config
-        self.use_gather = not current_platform.is_tpu() \
-            or envs.VLLM_USE_V1 \
-            or parallel_config.distributed_executor_backend == "external_launcher"
+        self.use_all_gather = envs.VLLM_USE_V1 \
+                              or parallel_config.distributed_executor_backend == "external_launcher"
 
     def construct(
         self,
@@ -89,6 +87,8 @@ class LogitsProcessor(nn.Cell):
             logits = hidden_states
         else:
             if sampling_metadata is not None:
+                if sampling_metadata.selected_token_indices.numel() <= 0:
+                    return mint.zeros((0, self.vocab_size), dtype=hidden_states.dtype)
                 hidden_states = _prune_hidden_states(hidden_states, sampling_metadata)
 
             # Get the logits for the next tokens.
@@ -103,7 +103,8 @@ class LogitsProcessor(nn.Cell):
                 logits *= self.scale
 
             # Apply logits processors (if any).
-            if sampling_metadata is not None:
+            if sampling_metadata is not None and \
+                    sampling_metadata.seq_groups is not None:
                 logits = _apply_logits_processors(logits, sampling_metadata)
 
         return logits
@@ -118,16 +119,16 @@ class LogitsProcessor(nn.Cell):
         logits = lm_head.quant_method.apply(
             lm_head, hidden_states, bias=embedding_bias
         )
-        if self.use_gather:
-            # None may be returned for rank > 0
-            logits = tensor_model_parallel_gather(logits)
-        else:
+        if self.use_all_gather:
             # Gather is not supported for some devices such as TPUs.
             # Use all-gather instead.
             # NOTE(woosuk): Here, the outputs of every device should not be None
             # because XLA requires strict SPMD among all devices. Every device
             # should execute the same operations after gathering the logits.
             logits = tensor_model_parallel_all_gather(logits)
+        else:
+            # None may be returned for rank > 0
+            logits = tensor_model_parallel_gather(logits)
         # Remove paddings in vocab (if any).
         if logits is not None:
             logits = logits[..., : self.org_vocab_size]
@@ -147,10 +148,10 @@ def _prune_hidden_states(
     # NOTE(kzawora): The if guard is needed for Gaudi - in some scenarios
     # (warmup, profile_run) we might not have selected_token_indices,
     # so we skip pruning.
-    if sampling_metadata.selected_token_indices is not None:
-        return hidden_states.index_select(0, sampling_metadata.selected_token_indices)
-    else:
-        return hidden_states
+    indices = sampling_metadata.selected_token_indices
+    if indices is not None and indices.numel() > 0:
+        return mint.index_select(hidden_states, 0, sampling_metadata.selected_token_indices)
+    return hidden_states
 
 
 def _apply_logits_processors(
@@ -188,7 +189,7 @@ def _apply_logits_processors(
         logits_processed += len(seq_group.sample_indices) + len(
             seq_group.prompt_logprob_indices
         )
-    
+
     for logits_row_idx, future in logits_row_ids_and_logits_row_futures:
         logits[logits_row_idx] = future.result()
 
@@ -196,6 +197,7 @@ def _apply_logits_processors(
         # verifies that no rows in logits were missed unexpectedly
         assert logits_processed == logits.shape[0]
     return logits
+
 
 def _apply_logits_processors_single_seq(logits_row, logits_processors,
                                         past_tokens_ids,

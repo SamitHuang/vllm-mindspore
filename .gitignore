@@ -139,7 +139,3 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
-
-# mindspore
-aclinit_*.json
-fusion_result.json

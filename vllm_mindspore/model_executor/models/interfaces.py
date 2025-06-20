@@ -18,13 +18,13 @@
 
 from typing import (TYPE_CHECKING, ClassVar, Dict, List, Literal, Optional,
                     Protocol, Type, Union, overload, runtime_checkable)
-from typing_extensions import TypeVar
-import mindspore as ms
-from vllm.multimodal.inputs import NestedTensors
-from vllm.attention import AttentionMetadata
 
+from mindspore import Tensor
 
-T = TypeVar("T", default="NestedTensors")
+if TYPE_CHECKING:
+    from vllm.attention import AttentionMetadata
+
+MultiModalEmbeddings = Union[list[Tensor], Tensor, tuple[Tensor, ...]]
 
 
 @runtime_checkable
@@ -40,16 +40,11 @@ class SupportsMultiModal(Protocol):
         MRO of your model class.
     """
 
-    def get_multimodal_embeddings(self, **kwargs) -> Optional[T]:
+    def get_multimodal_embeddings(
+            self, **kwargs: object) -> Optional[MultiModalEmbeddings]:
         """
         Returns multimodal embeddings generated from multimodal kwargs 
         to be merged with text embeddings.
-
-        The output embeddings must be one of the following formats:
-    
-        - A list or tuple of 2D tensors, where each tensor corresponds to
-          each input multimodal data item (e.g, image).
-        - A single 3D tensor, with the batch dimension grouping the 2D tensors.
 
         Note:
             The returned multimodal embeddings must be in the same order as
@@ -63,24 +58,25 @@ class SupportsMultiModal(Protocol):
     @overload
     def get_input_embeddings(
         self,
-        input_ids: ms.Tensor,
-        multimodal_embeddings: Optional[T] = None,
+        input_ids: Tensor,
+        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
         attn_metadata: Optional["AttentionMetadata"] = None,
-    ) -> ms.Tensor:
+    ) -> Tensor:
         ...
 
     @overload
     def get_input_embeddings(
         self,
-        input_ids: ms.Tensor,
-        multimodal_embeddings: Optional[T] = None,
-    ) -> ms.Tensor:
+        input_ids: Tensor,
+        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
+    ) -> Tensor:
         """
         Returns the input embeddings merged from the text embeddings from 
         input_ids and the multimodal embeddings generated from multimodal 
         kwargs.
         """
         ...
+
 
 @runtime_checkable
 class SupportsLoRA(Protocol):

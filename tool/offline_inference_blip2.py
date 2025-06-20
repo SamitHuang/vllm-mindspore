@@ -1,6 +1,7 @@
 import vllm_mindspore  # Add this line on the top of script.
 from PIL import Image
 from vllm import LLM, SamplingParams
+import mindspore as ms
 
 
 def prepare_text(prompt: str):
@@ -24,8 +25,8 @@ def main(args):
     # Create an LLM.
     llm = LLM(
         model=model_path,
-        max_num_seqs=8,
         tensor_parallel_size=args.tp_size,
+        dtype=ms.float16,
     )
 
     # Generate texts from the prompts. The output is a list of RequestOutput objects
@@ -50,7 +51,7 @@ if __name__ == "__main__":
         "--model_path", type=str, default="/home/mikecheung/model/blip2-opt-2.7b"
     )
     parser.add_argument("--image_path", type=str, default="demo.jpeg")
-    parser.add_argument("--tp_size", type=int, default=1)
+    parser.add_argument("--tp_size", type=int, default=None)
     args, _ = parser.parse_known_args()
 
     main(args)
