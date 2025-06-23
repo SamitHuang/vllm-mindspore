@@ -18,7 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only OPT model compatible with HuggingFace weights."""
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import mindspore as ms
 import mindspore.mint as mint
@@ -489,14 +489,19 @@ class OPTForCausalLM(NativeModel, SupportsPP):
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str, ms.Tensor]]) -> Set[str]:
-        params_dict = self.get_params_dict()
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, ms.Tensor]],
+        params_dict: Optional[Dict[str, ms.Parameter]] = None,
+    ) -> Set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
+        if params_dict is None:
+            params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
             if "lm_head.weight" in name and self.config.tie_word_embeddings:

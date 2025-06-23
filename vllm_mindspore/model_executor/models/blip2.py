@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from functools import cached_property
-from typing import Iterable, Mapping, Optional, Set, Tuple, Union
+from typing import Dict, Iterable, Mapping, Optional, Set, Tuple, Union
 
 import mindspore as ms
 import mindspore.mint as mint
@@ -701,9 +701,14 @@ class Blip2ForConditionalGeneration(
     ) -> Optional[SamplerOutput]:
         return self.language_model.sample(logits, sampling_metadata)
 
-    def load_weights(self, weights: Iterable[Tuple[str, ms.Tensor]]) -> Set[str]:
-        params_dict = self.get_params_dict()
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, ms.Tensor]],
+        params_dict: Optional[Dict[str, ms.Parameter]] = None,
+    ) -> Set[str]:
         dtype = self.model_config.dtype
+        if params_dict is None:
+            params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, weight in weights:
             weight = weight.to(dtype)
@@ -713,7 +718,7 @@ class Blip2ForConditionalGeneration(
                 )
             elif "language_model." in name:
                 loaded_param = self.language_model.load_weights(
-                    [(name.replace("language_model.", ""), weight)]
+                    [(name.replace("language_model.", ""), weight)], params_dict
                 )
             else:
                 param = params_dict[name]
